@@ -1519,6 +1519,7 @@ void lrs_free_dat(lrs_dat *Q) {
   lrs_clear_mp_vector(Q->Lcm, Q->m);
 
   lrs_clear_mp(Q->Nvolume);
+  lrs_clear_mp(Q->Dvolume);
 
   free(Q->redundcol);
   free(Q->inequality);
