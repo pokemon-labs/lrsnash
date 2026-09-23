@@ -41,9 +41,16 @@ long lrs_nashoutput(lrs_dat *Q, lrs_mp_vector output, FloatOneSumOutput *gg,
 
 void BuildRepP1Is0(lrs_dic *P, lrs_dat *Q, const FastInput *g);
 void BuildRepP1Is1(lrs_dic *P, lrs_dat *Q, const FastInput *g);
+void BuildRepP1Is0_Full(lrs_dic *P, lrs_dat *Q, const Input *g);
+void BuildRepP1Is1_Full(lrs_dic *P, lrs_dat *Q, const Input *g);
+
 void FillConstraintRowsP1Is0(lrs_dic *P, lrs_dat *Q, const FastInput *g,
                              int firstRow);
 void FillConstraintRowsP1Is1(lrs_dic *P, lrs_dat *Q, const FastInput *g,
+                             int firstRow);
+void FillConstraintRowsP1Is0_Full(lrs_dic *P, lrs_dat *Q, const Input *g,
+                             int firstRow);
+void FillConstraintRowsP1Is1_Full(lrs_dic *P, lrs_dat *Q, const Input *g,
                              int firstRow);
 void FillFirstRow(lrs_dic *P, lrs_dat *Q, int n);
 void FillLinearityRow(lrs_dic *P, lrs_dat *Q, int m, int n);
@@ -151,6 +158,88 @@ void solve_fast(const FastInput *g, FloatOneSumOutput *gg) {
 
   gg->value /= g->den;
 }
+
+void solve_full(const Input *g, FloatOneSumOutput *gg) {
+  lrs_init();
+
+  lrs_dic *P1;      /* structure for holding current dictionary and indices */
+  lrs_dat *Q1, *Q2; /* structure for holding static problem data            */
+
+  lrs_mp_vector output1;
+  lrs_mp_vector output2;
+  lrs_mp_matrix Lin; /* holds input linearities if any are found             */
+  lrs_mp_matrix A2orig;
+  lrs_dic *P2orig; /* we will save player 2's dictionary in getabasis      */
+
+  long *linindex; /* for faster restart of player 2                       */
+
+  long col; /* output column index for dictionary                   */
+  long numequilib = 0; /* number of nash equilibria found */
+  long oldnum = 0;
+
+  FirstTime = TRUE;
+
+  Q1 = lrs_alloc_dat();
+
+  Q1->n = g->rows + 2;
+  Q1->m = g->rows + g->cols + 1;
+
+  P1 = lrs_alloc_dic(Q1);
+
+  BuildRepP1Is1_Full(P1, Q1, g);
+
+  output1 = lrs_alloc_mp_vector(Q1->n + Q1->m);
+
+  Q2 = lrs_alloc_dat();
+
+  Q2->n = g->cols + 2;
+  Q2->m = g->rows + g->cols + 1;
+
+  P2orig = lrs_alloc_dic(Q2);
+  BuildRepP1Is0_Full(P2orig, Q2, g);
+  A2orig = P2orig->A;
+
+  output2 = lrs_alloc_mp_vector(Q1->n + Q1->m);
+
+  linindex = static_cast<long *>(
+      calloc((P2orig->m + P2orig->d + 2), sizeof(long))); /* for next time */
+
+  if (!lrs_getfirstbasis(&P1, Q1, &Lin, TRUE)) {
+    printf("lrs_getfirstbasis failed\n");
+    throw std::exception();
+  }
+
+  col = Q1->nredundcol;
+
+  do {
+    if (lrs_getsolution(P1, Q1, output1, col)) {
+      oldnum = numequilib;
+      nash2_main(P1, Q1, P2orig, Q2, &numequilib, output2, gg, linindex);
+      if (numequilib > oldnum) {
+        lrs_nashoutput(Q1, output1, gg, 1L);
+        // break;
+      }
+    }
+  } while (lrs_getnextbasis(&P1, Q1));
+
+  lrs_clear_mp_vector(output1, Q1->m + Q1->n);
+  lrs_clear_mp_vector(output2, Q1->m + Q1->n);
+
+  lrs_free_dic(P1, Q1);
+  lrs_free_dat(Q1);
+
+  /* reset these or you crash free_dic */
+  Q2->Qhead = P2orig;
+  P2orig->A = A2orig;
+
+  lrs_free_dic(P2orig, Q2);
+  lrs_free_dat(Q2);
+
+  free(linindex);
+
+  gg->value /= g->den;
+}
+
 
 long nash2_main(lrs_dic *P1, lrs_dat *Q1, lrs_dic *P2orig, lrs_dat *Q2,
                 long *numequilib, lrs_mp_vector output, FloatOneSumOutput *gg,
@@ -535,11 +624,29 @@ void BuildRepP1Is0(lrs_dic *P, lrs_dat *Q, const FastInput *g) {
   FillFirstRow(P, Q, n);
 }
 
+void BuildRepP1Is0_Full(lrs_dic *P, lrs_dat *Q, const Input *g) {
+  long m = Q->m; /* number of inequalities      */
+  long n = Q->n;
+  FillConstraintRowsP1Is0_Full(P, Q, g, 1);
+  FillNonnegativityRows(P, Q, g->rows + 1, g->rows + g->cols, n);
+  FillLinearityRow(P, Q, m, n);
+  FillFirstRow(P, Q, n);
+}
+
 void BuildRepP1Is1(lrs_dic *P, lrs_dat *Q, const FastInput *g) {
   long m = Q->m; /* number of inequalities      */
   long n = Q->n;
   FillNonnegativityRows(P, Q, 1, g->rows, n);
   FillConstraintRowsP1Is1(P, Q, g, g->rows + 1); // 1 here
+  FillLinearityRow(P, Q, m, n);
+  FillFirstRow(P, Q, n);
+}
+
+void BuildRepP1Is1_Full(lrs_dic *P, lrs_dat *Q, const Input *g) {
+  long m = Q->m; /* number of inequalities      */
+  long n = Q->n;
+  FillNonnegativityRows(P, Q, 1, g->rows, n);
+  FillConstraintRowsP1Is1_Full(P, Q, g, g->rows + 1); // 1 here
   FillLinearityRow(P, Q, m, n);
   FillFirstRow(P, Q, n);
 }
@@ -617,6 +724,25 @@ void FillConstraintRowsP1Is0(lrs_dic *P, lrs_dat *Q, const FastInput *g,
   }
 }
 
+
+void FillConstraintRowsP1Is0_Full(lrs_dic *P, lrs_dat *Q, const Input *g,
+                             int firstRow) {
+  const int MAXCOL = 1000; /* maximum number of columns */
+  long num[MAXCOL];
+  int row, s, t;
+
+  for (row = firstRow; row < firstRow + g->rows; row++) {
+    num[0] = 0;
+    s = row - firstRow;
+    for (t = 0; t < g->cols; t++) {
+      num[t + 1] = -g->row_data[s * g->cols + t];
+    }
+    num[g->cols + 1] = 1;
+    lrs_set_row_constraint(P, Q, row, num, GE);
+  }
+}
+
+
 void FillConstraintRowsP1Is1(lrs_dic *P, lrs_dat *Q, const FastInput *g,
                              int firstRow) {
   const int MAXCOL = 1000; /* maximum number of columns */
@@ -628,6 +754,23 @@ void FillConstraintRowsP1Is1(lrs_dic *P, lrs_dat *Q, const FastInput *g,
     s = row - firstRow;
     for (t = 0; t < g->rows; t++) {
       num[t + 1] = g->data[t * g->cols + s] - g->den;
+    }
+    num[g->rows + 1] = 1;
+    lrs_set_row_constraint(P, Q, row, num, GE);
+  }
+}
+
+void FillConstraintRowsP1Is1_Full(lrs_dic *P, lrs_dat *Q, const Input *g,
+                             int firstRow) {
+  const int MAXCOL = 1000; /* maximum number of columns */
+  long num[MAXCOL];
+  int row, s, t;
+
+  for (row = firstRow; row < firstRow + g->cols; row++) {
+    num[0] = 0;
+    s = row - firstRow;
+    for (t = 0; t < g->rows; t++) {
+      num[t + 1] = -g->col_data[t * g->cols + s];
     }
     num[g->rows + 1] = 1;
     lrs_set_row_constraint(P, Q, row, num, GE);
