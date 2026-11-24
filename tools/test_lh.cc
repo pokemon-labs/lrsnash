@@ -2,9 +2,9 @@
 // missing label k0: fast tableau kernels bit-identical to the reference and
 // across I64/I128/lrsmp/GMP; every result an exact Nash equilibrium with
 // exactly the reported payoffs (GMP rational check). Also checks the public
-// API: solve_full(Mode::Any, label) runs Lemke-Howson with missing label
-// label + 1 and rejects labels outside [0, rows + cols); every solve_*
-// rejects rows < 1 or cols < 1.
+// API: solve(GeneralSumGame*, Mode::Any, label) runs Lemke-Howson with
+// missing label label + 1 and rejects labels outside [0, rows + cols); every
+// solve / extreme_equilibria overload rejects rows < 1 or cols < 1.
 //   g++ -O2 -std=c++17 -Isrc tools/test_lh.cc -lgmp -o test_lh
 //   ./test_lh trials maxdim seed
 #include "lrsnash/lemke.hpp"
@@ -68,13 +68,13 @@ static bool verify(long m, long n, const std::vector<int> &A, const std::vector<
   mpz_clears(SX, SY, t, acc, best, tot, lhs, rhs, nullptr);
   return ok;
 }
-// public API: solve_full(Mode::Any, k0 - 1) must equal LemkeHowson.run(k0) exactly
+// public API: solve(GeneralSumGame*, Mode::Any, k0 - 1) must equal LemkeHowson.run(k0) exactly
 static SolverGMP api;
 static bool api_same(long m, long n, std::vector<int> &A, std::vector<int> &B, long k0) {
   std::vector<float> rs(m), cs(n), rr(m), cr(n);
-  Input in{m, n, 7, A.data(), B.data()};
-  FloatOneSumOutput out{rs.data(), cs.data(), 0.f};
-  api.solve_full(&in, &out, Mode::Any, k0 - 1);
+  GeneralSumGame in{m, n, 7, A.data(), B.data()};
+  FloatEquilibrium out{rs.data(), cs.data(), 0.f};
+  api.solve(&in, &out, Mode::Any, k0 - 1);
   detail::LemkeHowson<GMP> lh;
   lh.setup(m, n, [&](long i, long j) { return A[i * n + j]; }, [&](long i, long j) { return B[i * n + j]; });
   lh.run(k0);
@@ -83,27 +83,29 @@ static bool api_same(long m, long n, std::vector<int> &A, std::vector<int> &B, l
 }
 static bool api_rejects(long m, long n, std::vector<int> &A, std::vector<int> &B) {
   std::vector<float> rs(m), cs(n);
-  Input in{m, n, 1, A.data(), B.data()};
-  FloatOneSumOutput out{rs.data(), cs.data(), 0.f};
+  GeneralSumGame in{m, n, 1, A.data(), B.data()};
+  FloatEquilibrium out{rs.data(), cs.data(), 0.f};
   for (long bad : {-1L, m + n}) {
-    try { api.solve_full(&in, &out, Mode::Any, bad); return false; } catch (std::invalid_argument &) {}
+    try { api.solve(&in, &out, Mode::Any, bad); return false; } catch (std::invalid_argument &) {}
   }
   return true;
 }
-// every solve_* rejects rows < 1 or cols < 1 with invalid_argument
+// every solve / extreme_equilibria overload rejects rows < 1 or cols < 1
+// with invalid_argument
 static bool dims_rejected() {
   std::vector<int> A(4, 1), B(4, 1); std::vector<float> rs(4), cs(4);
-  FloatOneSumOutput out{rs.data(), cs.data(), 0.f};
+  FloatEquilibrium out{rs.data(), cs.data(), 0.f};
   for (long m : {0L, 2L}) for (long n : {0L, 2L}) {
     if (m > 0 && n > 0) continue;
     int caught = 0;
-    Input in{m, n, 1, A.data(), B.data()}; FastInput fin{m, n, A.data(), 1};
+    GeneralSumGame gs{m, n, 1, A.data(), B.data()}; ConstantSumGame cg{m, n, A.data(), 1};
     for (Mode md : {Mode::Any, Mode::Last}) {
-      try { api.solve_full(&in, &out, md); } catch (std::invalid_argument &) { ++caught; }
-      try { api.solve_fast(&fin, &out, md); } catch (std::invalid_argument &) { ++caught; }
+      try { api.solve(&gs, &out, md); } catch (std::invalid_argument &) { ++caught; }
+      try { api.solve(&cg, &out, md); } catch (std::invalid_argument &) { ++caught; }
     }
-    try { api.solve_all(m, n, A.data(), B.data()); } catch (std::invalid_argument &) { ++caught; }
-    if (caught != 5) return false;
+    try { api.extreme_equilibria(&gs); } catch (std::invalid_argument &) { ++caught; }
+    try { api.extreme_equilibria(&cg); } catch (std::invalid_argument &) { ++caught; }
+    if (caught != 6) return false;
   }
   return true;
 }

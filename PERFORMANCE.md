@@ -12,7 +12,7 @@ libraries.
 
 | case | legacy, best working type | new | speedup |
 |---|---|---|---|
-| 9x9 constant-sum (`solve_fast`) | 3,542 µs (int128) | 2.0 µs (int64, LP) | ~1,700x |
+| 9x9 constant-sum (`solve(ConstantSumGame*)`) | 3,542 µs (int128) | 2.0 µs (int64, LP) | ~1,700x |
 | 15x15 constant-sum | 2,272,304 µs (GMP) | 11.8 µs (auto, LP) | ~190,000x |
 | 9x9 general-sum, exact legacy result | 3,781 µs (int128) | 618 µs (int64) | 6.1x |
 | 15x15 general-sum, exact legacy result | 1,434,309 µs (GMP) | 139,297 µs (int128) | 10.3x |
@@ -87,7 +87,7 @@ algorithm for constant-sum games, then make the remaining arithmetic cheap.
 **Why it is allowed.** By the minimax theorem, the Nash equilibria of a
 constant-sum game are exactly the pairs (optimal x, optimal y). They are
 interchangeable and share one value. So any optimal pair answers
-`solve_fast` correctly. CONTEXT.md had already recorded that "first
+the constant-sum `solve` correctly. CONTEXT.md had already recorded that "first
 equilibrium" is fully correct for constant-sum games.
 
 **What is solved** (`src/lrsnash/zerosum.hpp`). Shift the payoffs to
@@ -112,7 +112,7 @@ finishes. Leaving rule: minimum ratio, ties broken by smallest index.
 115,000. 9x9 takes 2.0 µs. The one semantic difference: in degenerate games
 with several optimal strategies, the LP may return a different, equally
 optimal pair than legacy's "last enumerated" one. Legacy-exact behaviour is
-still available as `solve_fast(..., Mode::Last)`.
+still available as `solve(&constant_sum_game, &out, Mode::Last)`.
 
 ## 3. Exact division by multiplying with an inverse
 

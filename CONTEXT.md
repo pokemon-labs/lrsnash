@@ -42,8 +42,9 @@ callers through a small API (`src/lib.h`, namespace `LRSNash`).
     - `nash.hpp` — the lrsnash driver (exact upstream equilibrium order).
     - `zerosum.hpp` — the exact LP for constant-sum games.
     - `lemke.hpp` — exact Lemke-Howson.
-    - `solve.hpp` — the `SolverT<Ar...>` entry points (`solve_fast`,
-      `solve_full`, `solve_all`).
+    - `solve.hpp` — the `SolverT<Ar...>` entry points (`solve` and
+      `extreme_equilibria`, overloaded on `ConstantSumGame` and
+      `GeneralSumGame`; decision 9).
   - `tools/` — benchmarks, exactness tests and differential tests (see
     "Tooling" below).
 
@@ -121,14 +122,18 @@ compiled into four static libraries (`lrslib`=MP, `lrslib64`, `lrslib128`,
   - `SolverT<Ar...>`, with aliases `Solver64`, `Solver128`, `SolverMP`,
     `SolverGMP` (explicit type; overflow throws) and `Solver` (optional auto
     chain).
-  - `solve_fast(FastInput*, out, Mode = Any)` and
-    `solve_full(Input*, out, Mode = Any)`, with
-    `Mode {Last, First, Any}`.
-  - `solve_all(rows, cols, A, B)`, which returns
-    `std::vector<Equilibrium>`.
+  - Two independent choices (decision 9): the game class is the input
+    type, and the method says what is returned.
 
-  The defaults are decided; see "Decisions". The **names are under
-  review**: see Q1 in "Open questions".
+    |                   | one equilibrium (`Mode`)  | every extreme equilibrium |
+    |---|---|---|
+    | `ConstantSumGame` | `solve(&g, &out, mode)`   | `extreme_equilibria(&g)`  |
+    | `GeneralSumGame`  | `solve(&g, &out, mode, k)` | `extreme_equilibria(&g)` |
+
+    `Mode {Last, First, Any}`. `solve` writes a `FloatEquilibrium`;
+    `extreme_equilibria` returns `std::vector<Equilibrium>`.
+
+  The defaults are decided; see "Decisions".
 - The caller chooses the arithmetic type. Dynamic switching stays opt-in (user
   preference, 2026-11-23).
 
@@ -184,11 +189,14 @@ compiled into four static libraries (`lrslib`=MP, `lrslib64`, `lrslib128`,
    implementation, written as idiomatic modern C++ (C++17). It must keep the
    hard constraints: header-only, no globals, reentrant, and all four
    arithmetic types.
-   1. **Public API.** Switch `src/lib.h` to the header-only solvers. Keep
-      `FastInput`, `Input` and `FloatOneSumOutput` source-compatible. Expose
-      explicit arithmetic choice, `Mode`, `solve_all`, and a reusable
-      per-thread solver object. Deferred until after 6.4 (decision 3); the
-      type is chosen in code (decision 4).
+   1. **Public API.** Switch `src/lib.h` to the header-only solvers. The
+      structs keep their fields, under the new names `ConstantSumGame`,
+      `GeneralSumGame` and `FloatEquilibrium` (aliases of the legacy structs
+      until then; at the switch they become the definitions and the legacy
+      names go, decision 9). Expose explicit arithmetic choice, `Mode`,
+      `extreme_equilibria`, and a reusable per-thread solver object.
+      Deferred until after 6.4 (decision 3); the type is chosen in code
+      (decision 4).
    2. **Build.** Replace the four static libraries with one CMake INTERFACE
       target, `lrsnash` (decision 4). Turn `tools/test_*` and `bench` into
       CTest/optional targets.
@@ -209,7 +217,7 @@ compiled into four static libraries (`lrslib`=MP, `lrslib64`, `lrslib128`,
       - a static review against the paper and upstream (user preference).
    5. **Errors and output.** Exceptions only (no printf, exit or abort);
       already true for the new code. Exactly `rows`/`cols` output entries.
-      Exact (rational) output for `solve_all` if wanted.
+      Exact (rational) output for `extreme_equilibria` if wanted (Q2).
    6. **Optional:** restore rational `num/den` payoffs (scale each player's
       matrix by the lcm of its denominators), and add compile-time dimension
       bounds or stack storage for tiny games.
@@ -544,6 +552,11 @@ optional extra; keep it optional.
 
 ## Decisions (answered by the user, 2026-11-23)
 
+Decisions 1-8 use the API names of the time. In the names of decision 9:
+`solve_fast` = `solve(const ConstantSumGame*)`, `solve_full` =
+`solve(const GeneralSumGame*)`, and `solve_all` =
+`extreme_equilibria(const GeneralSumGame*)`.
+
 1. **`solve_fast` (constant-sum) default: `Mode::Any`**, the exact LP. The
    value always equals legacy's. In degenerate games the strategies can
    differ from legacy's "last" equilibrium; that is accepted.
@@ -556,7 +569,7 @@ optional extra; keep it optional.
    on legacy.
 4. **Type selection after the switch: one target, type in code.** A single
    CMake INTERFACE target `lrsnash`. Callers pick the type in code
-   (`LRSNash::Solver64 s; s.solve_fast(...)`). Downstream call sites and
+   (`LRSNash::Solver64 s; s.solve(&game, &out)`). Downstream call sites and
    CMake will change when the switch happens; the four legacy target names
    are not kept.
 5. **API extras: all three wanted.**
@@ -575,6 +588,33 @@ optional extra; keep it optional.
    `-O3` equals `-O2` within noise; `-march=native` gives 11% (LP), 30% (LH)
    and 13% (Last) at 9x9 int64, and nothing at 15x15 int128.
 
+9. **API names: renamed** (the user, 2026-11-23: "just do the rename").
+   `solve_fast`/`solve_full` read as "first"/"all" equilibria, and the old
+   API mixed two independent axes. Now:
+   - `solve(const ConstantSumGame*, FloatEquilibrium*, Mode = Any)`;
+   - `solve(const GeneralSumGame*, FloatEquilibrium*, Mode = Any,
+     long missing_label = 0)`;
+   - `extreme_equilibria(const ConstantSumGame*)` (new: this combination
+     did not exist before);
+   - `extreme_equilibria(const GeneralSumGame*)` (was `solve_all`).
+
+   `ConstantSumGame`, `GeneralSumGame` and `FloatEquilibrium` are aliases of
+   the legacy `lib.h` structs `FastInput`, `Input` and `FloatOneSumOutput`.
+   Legacy `lib.h` keeps the old names until the switch, because downstream
+   still builds it.
+
+   The user approved the rename without reviewing the sub-choices. Claude
+   applied them as it had recommended; they can be revisited:
+   - `constant_sum`, not `zero_sum`: player 2 gets `den - data`, not
+     `-data`;
+   - `extreme_equilibria`, not `solve_all`: only the extreme equilibria are
+     returned, and degenerate games can have infinitely many equilibria;
+   - the name `FloatEquilibrium` for the output struct;
+   - `Equilibrium` payoffs are now **divided by `den`**, like `value`
+     (`solve_all` reported matrix units; only `tools/` used it);
+   - pointers, not references, as in legacy;
+   - `Mode` is unchanged.
+
 Earlier decision: the caller chooses the arithmetic type and overflow
 throws. The `Solver` auto alias stays as an optional extra (user,
 2026-11-23).
@@ -586,51 +626,8 @@ interface question goes here, as do decisions Claude took alone that the user
 may want to revisit. Work continues around them. When one is answered, move it
 to "Decisions" above.
 
-**Q1. Public API names** (raised by the user, 2026-11-23). *Status:* open,
-nothing renamed yet. *Blocks:* nothing (work continues under the current
-names), but it is better settled before the `lib.h` switch, and before Q2/Q3
-add more API.
-- Problem: `solve_fast` (constant-sum) and `solve_full` (general-sum) read as
-  "first equilibrium" and "all equilibria". The API has two independent axes:
-  - the game class: constant-sum or general-sum;
-  - the answer: one equilibrium (`Mode` chooses which) or all extreme
-    equilibria.
-
-  Today only 3 of the 4 combinations exist: there is no "all" for
-  constant-sum.
-- Recommended: one name per kind of answer, with the game class in the input
-  type (overloads):
-  ```cpp
-  solve(const ConstantSumGame*, FloatOneSumOutput*, Mode = Any);
-  solve(const GeneralSumGame*, FloatOneSumOutput*, Mode = Any, long missing_label = 0);
-  extreme_equilibria(const ConstantSumGame*);   // new combination
-  extreme_equilibria(const GeneralSumGame*);    // was solve_all
-  ```
-  The game class is a property of the input, so its type is the right place
-  for it. The algorithm follows from the game class plus `Mode`. `value` means
-  the same in both overloads (the row player's payoff / den). The constant-sum
-  "all" is nearly free: it is the enumeration that `Last` already runs on
-  `(data, den - data)`.
-- Alternative: put the game class in the name (`solve_constant_sum`,
-  `solve_general_sum`), plus two "all" names. Four names, combinatorial.
-- Sub-questions:
-  - **Q1a.** `constant_sum` or `zero_sum`? Recommend `constant_sum`: player 2's
-    payoff is `den - data`, not `-data`.
-  - **Q1b.** `extreme_equilibria` or `solve_all`? Recommend
-    `extreme_equilibria`: degenerate games can have infinitely many
-    equilibria, and only the extreme ones are returned.
-  - **Q1c.** Struct names. Make `FastInput` → `ConstantSumGame` and `Input` →
-    `GeneralSumGame` aliases in `solve.hpp` now, with the real definitions at
-    the `lib.h` switch. `FloatOneSumOutput` is also wrong for general-sum
-    games (the payoffs need not sum to one): rename it at the switch (e.g.
-    `FloatEquilibrium`) or keep it?
-  - **Q1d.** Units of the `extreme_equilibria` payoffs. Recommend dividing by
-    `den`, as `value` does. `solve_all` reports matrix units today, and only
-    `tools/` uses it.
-  - **Q1e.** (Noticed by Claude, not discussed.) Pointers (`const Game*`, as
-    legacy does) or references in the new API? Recommend keeping pointers
-    until the switch.
-  - `Mode {Any, First, Last}` is unchanged in both proposals.
+**Q1. Public API names**: answered, see decision 9. The sub-choices it
+lists were applied without review and stay revisitable.
 
 **Q2. Exact rational output for "all"** (decision 5 says wanted; its form is
 open). *Blocks:* that item of next step 4.
@@ -665,6 +662,16 @@ matters). Every `solve_*` throws `invalid_argument` unless rows, cols >= 1.
   rank-deficient path (it computed rays).
 - Legacy `lib.h` never defined what 0 sizes do.
 - Revisit if downstream can pass empty games.
+
+**Q5. `den <= 0`** (noticed by Claude, 2026-11-23; nothing changed).
+- `value` and the `Equilibrium` payoffs are divided by `den`, so `den = 0`
+  gives inf/NaN. For a `ConstantSumGame` that is exactly the zero-sum case
+  (B = -A). A negative `den` flips the sign. Legacy behaves the same.
+- Options:
+  - (a) reject `den <= 0` with `invalid_argument`;
+  - (b) document "`den > 0`";
+  - (c) for `den = 0`, report unscaled payoffs.
+- Recommend (a), because legacy's normalisation assumes `den > 0`.
 
 ## Current status / next steps (handoff, 2026-11-23)
 **User preferences.**
@@ -704,12 +711,13 @@ matters). Every `solve_*` throws `invalid_argument` unless rows, cols >= 1.
 - `zerosum.hpp`: the LP, with `promote_from` for the auto chain.
 - `lemke.hpp`: Lemke-Howson.
 - `solve.hpp`: `SolverT<Ar...>` and its aliases. It provides:
-  - `solve_fast(FastInput*, out, Mode = Any)`: `Any` is the LP, and `Last`
-    is exactly legacy `solve_fast`;
-  - `solve_full(Input*, out, Mode = Any, missing_label = 0)`: `Any` is
-    Lemke-Howson, and `Last` is exactly legacy `solve_full`;
-  - `solve_all(rows, cols, A, B)`, which returns every extreme equilibrium
-    with both payoffs.
+  - `solve(const ConstantSumGame*, out, Mode = Any)`: `Any` is the LP, and
+    `Last` is exactly legacy `solve_fast`;
+  - `solve(const GeneralSumGame*, out, Mode = Any, missing_label = 0)`:
+    `Any` is Lemke-Howson, and `Last` is exactly legacy `solve_full`;
+  - `extreme_equilibria(const ConstantSumGame*)` and
+    `extreme_equilibria(const GeneralSumGame*)`: every extreme equilibrium,
+    in upstream order, with both payoffs divided by `den`.
 
   It writes exactly `rows`/`cols` entries and has no globals. Every
   `solve_*` throws `std::invalid_argument` unless `rows, cols >= 1`.
@@ -735,7 +743,8 @@ matters). Every `solve_*` throws `invalid_argument` unless rows, cols >= 1.
    - a branch-light `lrs_ratio`/`reverse` for the fixed-width types (P1
      reverse search is about half of Last-mode time);
    - an AVX2 kernel behind a target attribute with runtime dispatch.
-4. API extras: exact rational `solve_all` output, rational payoff input.
+4. API extras: exact rational output of `extreme_equilibria`, rational
+   payoff input.
    **Blocked on the interface questions Q2 and Q3.**
 5. Later, when the user says so: switch `lib.h` to one INTERFACE target
    `lrsnash` with the type chosen in code (6.1, 6.2), archive legacy, then
@@ -825,6 +834,22 @@ matters). Every `solve_*` throws `invalid_argument` unless rows, cols >= 1.
     `find_basis` brings only decision variables in, so after compaction
     every remaining linearity is cobasic.
 
+**Progress (2026-11-23, session 5, after commit `1ae7810`).**
+- The API rename was applied (decision 9) as its own commit.
+  - `tools/test_api.cc` now also checks that, on constant-sum games, the
+    `ConstantSumGame` overloads (`extreme_equilibria`, `solve` Last/First)
+    give exactly the `GeneralSumGame` results on `(a, den - a)`.
+  - `tools/test_lh.cc` checks that every overload rejects 0-size games.
+  - `tools/bench.cc` modes are now `{cs,gs}-{any,first,last,all}`, with the
+    old names kept as aliases. Games are drawn as before, so results stay
+    comparable.
+  - All gates passed at low counts (`test_lp` 300, `test_lh` 150, `test_api`
+    200, `test_refactor` 300 games): 0 mismatches.
+- Work-plan step 3 gap: the completeness check for degenerate games is
+  written: `tools/dump_eq.cc` and `tools/check_complete.py` (brute-force
+  vertex pairs in exact rationals). They are in the working tree, not
+  committed. Results are below once it has run.
+
 Not planned: a fixed 256/512-bit type (only helps at 30x30 and larger; it
 is the item to revisit if 50x50 matters).
 Caveat: Lemke-Howson has exponential worst-case paths (Savani–von
@@ -840,7 +865,7 @@ python3 tools/instrument_legacy.py /tmp/legacy && (cd /tmp/legacy && for f in li
 g++ -O2 -std=c++17 -Isrc tools/test_api.cc /tmp/legacy/*.o -lgmp -o test_api && ./test_api 1000 8 1
 mkdir -p /tmp/ref/lrsnash_ref && for f in arith lrs nash; do git show fff2737:src/lrsnash/$f.hpp | sed 's/\bLRSNash\b/LRSNashRef/g' > /tmp/ref/lrsnash_ref/$f.hpp; done
 g++ -O2 -std=c++17 -Isrc -I/tmp/ref tools/test_refactor.cc -lgmp -o test_refactor && ./test_refactor 3000 9 1
-g++ -O2 -std=c++17 -Isrc tools/bench.cc -lgmp -o bench && ./bench 9 9 80 10000 100000001 fast auto
+g++ -O2 -std=c++17 -Isrc tools/bench.cc -lgmp -o bench && ./bench 9 9 80 10000 100000001 cs-any auto
 ```
 Every mismatch count should be 0. The exception is the
 `fast_test`-style comparison of `solve_fast` against the legacy *value*: it
@@ -849,7 +874,10 @@ shows rare mismatches on 9x9 games with payoffs 0..1000. Those are the legacy
 
 **Tooling in `tools/`.** The build and run commands are in each file's header.
 - `bench.cc`: benchmark of the header-only solvers, run as
-  `./bench rows cols den trials seed fast|full|all|first|any auto|i64|i128|mp|gmp`.
+  `./bench rows cols den trials seed {cs,gs}-{any,first,last,all} auto|i64|i128|mp|gmp`
+  (`cs` constant-sum, `gs` general-sum; `all` = `extreme_equilibria`). The
+  old mode names still work: `fast` = `cs-any`, `full` = `gs-last`, and
+  `first`, `any`, `all` = `gs-…`.
 - `test_lp.cc`, `test_lh.cc`: exactness tests for the LP and for
   Lemke-Howson (kernel bit-identity, exact NE checks in GMP).
 - `test_api.cc` + `instrument_legacy.py`: solve.hpp vs the legacy library,
