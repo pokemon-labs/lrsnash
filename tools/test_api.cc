@@ -1,6 +1,9 @@
 // Public API (src/lrsnash/solve.hpp) vs the legacy library, for all four
 // arithmetic types: solve_all must reproduce the full legacy output sequence,
-// solve_full(Last) the legacy result, solve_full(First) the first legacy pair.
+// solve_full(Last) the last legacy pair, solve_full(First) the first legacy
+// pair. "legacy float output differs" counts games where legacy's own float
+// output is wrong (mptoi truncates numerators that exceed long); it is
+// informational, not a mismatch.
 // Needs a legacy GMP build that records every lrs_nashoutput call into
 // g_seq; create it with tools/instrument_legacy.py:
 //   python3 tools/instrument_legacy.py /tmp/legacy && cd /tmp/legacy &&
@@ -31,7 +34,7 @@ static bool same(const std::vector<std::vector<double>> &x, const std::vector<st
   return true;
 }
 template <class S> struct Check {
-  const char *name; S s; long bad_all = 0, bad_last = 0, bad_first = 0, ovf = 0, n = 0;
+  const char *name; S s; long bad_all = 0, bad_last = 0, bad_first = 0, legacy_float_diff = 0, ovf = 0, n = 0;
   void run(long m, long n_, std::vector<int> &a, std::vector<int> &b, int den, const std::vector<std::vector<double>> &L,
            const std::vector<float> &lrs, const std::vector<float> &lcs, float lval) {
     try {
@@ -40,10 +43,19 @@ template <class S> struct Check {
       std::vector<float> rs(m + 2, -7.f), cs(n_ + 2, -7.f); FloatOneSumOutput out{rs.data(), cs.data(), 0.f};
       Input in{m, n_, den, a.data(), b.data()};
       s.solve_full(&in, &out, Mode::Last);
-      bool ok = closef(out.value, lval) && rs[m] == -7.f && cs[n_] == -7.f;
+      // vs the last pair of legacy's exact output sequence (the real gate)
+      const std::vector<double> *yl = nullptr, *xl = nullptr;
+      for (auto &r : L) { if (r[0] == 2.0) yl = &r; if (r[0] == 1.0) xl = &r; }
+      bool ok = yl && xl && closef(out.value, (*yl)[n_ + 1] / den) && rs[m] == -7.f && cs[n_] == -7.f;
+      for (long i = 0; ok && i < m; i++) ok &= closef(rs[i], (*xl)[i + 1]);
+      for (long j = 0; ok && j < n_; j++) ok &= closef(cs[j], (*yl)[j + 1]);
+      if (!ok) ++bad_last;
+      // vs legacy's float output, which mptoi truncation corrupts when a
+      // numerator exceeds long (informational, not a regression)
+      ok = closef(out.value, lval);
       for (long i = 0; i < m; i++) ok &= closef(rs[i], lrs[i]);
       for (long j = 0; j < n_; j++) ok &= closef(cs[j], lcs[j]);
-      if (!ok) ++bad_last;
+      if (!ok) ++legacy_float_diff;
       s.solve_full(&in, &out, Mode::First);   // first pair: first "2" record and first "1" record
       const std::vector<double> *y0 = nullptr, *x0 = nullptr;
       for (auto &r : L) { if (r[0] == 2.0 && !y0) y0 = &r; if (r[0] == 1.0 && !x0) x0 = &r; }
@@ -54,7 +66,7 @@ template <class S> struct Check {
       ++n;
     } catch (overflow_error &) { ++ovf; }
   }
-  void report() { printf("  %-10s games=%ld  all-seq mismatches=%ld  last mismatches=%ld  first mismatches=%ld  overflow=%ld\n", name, n, bad_all, bad_last, bad_first, ovf); }
+  void report() { printf("  %-10s games=%ld  all-seq mismatches=%ld  last mismatches=%ld  first mismatches=%ld  overflow=%ld  (legacy float output differs: %ld)\n", name, n, bad_all, bad_last, bad_first, ovf, legacy_float_diff); }
 };
 int main(int argc, char **argv) {
   int trials = atoi(argv[1]), maxdim = atoi(argv[2]); std::mt19937 gen(atoi(argv[3]));

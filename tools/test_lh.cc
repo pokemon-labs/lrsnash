@@ -1,10 +1,14 @@
 // Exactness tests for Lemke-Howson (src/lrsnash/lemke.hpp), for every
 // missing label k0: fast tableau kernels bit-identical to the reference and
 // across I64/I128/lrsmp/GMP; every result an exact Nash equilibrium with
-// exactly the reported payoffs (GMP rational check).
+// exactly the reported payoffs (GMP rational check). Also checks the public
+// API: solve_full(Mode::Any, label) runs Lemke-Howson with missing label
+// label + 1 and rejects labels outside [0, rows + cols); every solve_*
+// rejects rows < 1 or cols < 1.
 //   g++ -O2 -std=c++17 -Isrc tools/test_lh.cc -lgmp -o test_lh
 //   ./test_lh trials maxdim seed
 #include "lrsnash/lemke.hpp"
+#include "lrsnash/solve.hpp"
 #include <gmp.h>
 #include <cstdio>
 #include <random>
@@ -64,9 +68,49 @@ static bool verify(long m, long n, const std::vector<int> &A, const std::vector<
   mpz_clears(SX, SY, t, acc, best, tot, lhs, rhs, nullptr);
   return ok;
 }
+// public API: solve_full(Mode::Any, k0 - 1) must equal LemkeHowson.run(k0) exactly
+static SolverGMP api;
+static bool api_same(long m, long n, std::vector<int> &A, std::vector<int> &B, long k0) {
+  std::vector<float> rs(m), cs(n), rr(m), cr(n);
+  Input in{m, n, 7, A.data(), B.data()};
+  FloatOneSumOutput out{rs.data(), cs.data(), 0.f};
+  api.solve_full(&in, &out, Mode::Any, k0 - 1);
+  detail::LemkeHowson<GMP> lh;
+  lh.setup(m, n, [&](long i, long j) { return A[i * n + j]; }, [&](long i, long j) { return B[i * n + j]; });
+  lh.run(k0);
+  const double v = lh.solve_float(rr.data(), cr.data());
+  return rs == rr && cs == cr && out.value == (float)(v / 7);
+}
+static bool api_rejects(long m, long n, std::vector<int> &A, std::vector<int> &B) {
+  std::vector<float> rs(m), cs(n);
+  Input in{m, n, 1, A.data(), B.data()};
+  FloatOneSumOutput out{rs.data(), cs.data(), 0.f};
+  for (long bad : {-1L, m + n}) {
+    try { api.solve_full(&in, &out, Mode::Any, bad); return false; } catch (std::invalid_argument &) {}
+  }
+  return true;
+}
+// every solve_* rejects rows < 1 or cols < 1 with invalid_argument
+static bool dims_rejected() {
+  std::vector<int> A(4, 1), B(4, 1); std::vector<float> rs(4), cs(4);
+  FloatOneSumOutput out{rs.data(), cs.data(), 0.f};
+  for (long m : {0L, 2L}) for (long n : {0L, 2L}) {
+    if (m > 0 && n > 0) continue;
+    int caught = 0;
+    Input in{m, n, 1, A.data(), B.data()}; FastInput fin{m, n, A.data(), 1};
+    for (Mode md : {Mode::Any, Mode::Last}) {
+      try { api.solve_full(&in, &out, md); } catch (std::invalid_argument &) { ++caught; }
+      try { api.solve_fast(&fin, &out, md); } catch (std::invalid_argument &) { ++caught; }
+    }
+    try { api.solve_all(m, n, A.data(), B.data()); } catch (std::invalid_argument &) { ++caught; }
+    if (caught != 5) return false;
+  }
+  return true;
+}
 int main(int argc, char **argv) {
   int trials = atoi(argv[1]), maxdim = atoi(argv[2]); std::mt19937 gen(atoi(argv[3]));
-  long bad_k = 0, bad_eq = 0, o64 = 0, o128 = 0, runs = 0, piv = 0, maxpiv = 0;
+  long bad_k = 0, bad_eq = 0, bad_api = 0, o64 = 0, o128 = 0, runs = 0, piv = 0, maxpiv = 0;
+  if (!dims_rejected()) ++bad_api;
   for (int t = 0; t < trials; ++t) {
     long m = std::uniform_int_distribution<int>(1, maxdim)(gen), n = std::uniform_int_distribution<int>(1, maxdim)(gen);
     int kind = t % 4; int vmax = kind == 0 ? 2 : kind == 1 ? 100 : kind == 2 ? 1000000 : 81;
@@ -75,7 +119,9 @@ int main(int argc, char **argv) {
     if (t % 5 == 1 && m > 1) for (long j = 0; j < n; j++) { A[n + j] = A[j]; B[n + j] = B[j]; }
     if (t % 7 == 3 && n > 1) for (long i = 0; i < m; i++) { A[i * n + 1] = A[i * n]; B[i * n + 1] = B[i * n]; }
     if (t % 11 == 4) for (long k = 0; k < m * n; k++) B[k] = vmax - A[k];  // constant-sum
+    if (!api_rejects(m, n, A, B)) ++bad_api;
     for (long k0 = 1; k0 <= m + n; k0++) {
+      if (!api_same(m, n, A, B, k0)) ++bad_api;
       Ex g = run<GMP>(m, n, A, B, k0), gr = run<RefTab<GMP>>(m, n, A, B, k0);
       Ex a = run<I64>(m, n, A, B, k0), ar = run<RefTab<I64>>(m, n, A, B, k0);
       Ex b = run<I128>(m, n, A, B, k0), br = run<RefTab<I128>>(m, n, A, B, k0);
@@ -92,5 +138,5 @@ int main(int argc, char **argv) {
       ++runs; piv += g.piv; maxpiv = std::max(maxpiv, g.piv);
     }
   }
-  printf("games=%d runs(all k0)=%ld kernel_mismatch=%ld not_eq=%ld I64_overflow=%ld I128_overflow=%ld avg_pivots=%.2f max_pivots=%ld\n", trials, runs, bad_k, bad_eq, o64, o128, (double)piv / runs, maxpiv);
+  printf("games=%d runs(all k0)=%ld kernel_mismatch=%ld not_eq=%ld api_mismatch=%ld I64_overflow=%ld I128_overflow=%ld avg_pivots=%.2f max_pivots=%ld\n", trials, runs, bad_k, bad_eq, bad_api, o64, o128, (double)piv / runs, maxpiv);
 }

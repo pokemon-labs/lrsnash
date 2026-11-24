@@ -8,7 +8,7 @@ was measured, why each change was tried, and what it gained.
 **Branches.** All work since the initial stripped port lives on the `rewrite`
 branch: this file, `PERFORMANCE.md`, `src/lrsnash/` and the new `tools/`.
 `main` holds only the legacy code. Downstream users still build the legacy
-libraries until `lib.h` is switched over (see "Open decisions").
+libraries until `lib.h` is switched over (see "Decisions").
 
 ## What this repo is
 
@@ -122,12 +122,13 @@ compiled into four static libraries (`lrslib`=MP, `lrslib64`, `lrslib128`,
     `SolverGMP` (explicit type; overflow throws) and `Solver` (optional auto
     chain).
   - `solve_fast(FastInput*, out, Mode = Any)` and
-    `solve_full(Input*, out, Mode = Last)`, with
+    `solve_full(Input*, out, Mode = Any)`, with
     `Mode {Last, First, Any}`.
   - `solve_all(rows, cols, A, B)`, which returns
     `std::vector<Equilibrium>`.
 
-  The defaults are provisional; see "Open decisions".
+  The defaults are decided; see "Decisions". The **names are under
+  review**: see Q1 in "Open questions".
 - The caller chooses the arithmetic type. Dynamic switching stays opt-in (user
   preference, 2026-11-23).
 
@@ -186,21 +187,22 @@ compiled into four static libraries (`lrslib`=MP, `lrslib64`, `lrslib128`,
    1. **Public API.** Switch `src/lib.h` to the header-only solvers. Keep
       `FastInput`, `Input` and `FloatOneSumOutput` source-compatible. Expose
       explicit arithmetic choice, `Mode`, `solve_all`, and a reusable
-      per-thread solver object. This is blocked on the open decisions below.
-   2. **Build.** Replace the four static libraries with CMake INTERFACE
-      target(s). One idea: keep the names `lrslib`, `lrslib64`, `lrslib128`
-      and `lrslibgmp`, each selecting its type. Turn `tools/test_*` and
-      `bench` into CTest/optional targets.
+      per-thread solver object. Deferred until after 6.4 (decision 3); the
+      type is chosen in code (decision 4).
+   2. **Build.** Replace the four static libraries with one CMake INTERFACE
+      target, `lrsnash` (decision 4). Turn `tools/test_*` and `bench` into
+      CTest/optional targets.
    3. **Remove legacy.** Delete `src/lib.cc`, `src/lrslib.*`, `src/lrsmp.*`,
       `src/lrslong.*` and `src/lrsgmp.*` once the switch is done. Before that,
       capture any legacy-vs-new regression data still needed.
       `tools/instrument_legacy.py` needs the legacy sources, so archive a
       legacy build or tag `main` first.
-   4. **Idiomatic internals.** `lrs.hpp` and `nash.hpp` still mirror upstream
-      C line by line: upstream names, `long*` index arrays, 1-based loops,
-      out-parameters, magic row indices. Refactor them into clear C++ (small
-      structs, enums, views, RAII, named invariants) while keeping behaviour
-      **bit-identical**. Gates for every refactor:
+   4. **Idiomatic internals.** Done for `lrs.hpp` and `nash.hpp` (session
+      5, see the progress notes). They used to mirror upstream C line by
+      line, with upstream names, `long*` out-parameters and magic row
+      indices. Behaviour stays **bit-identical**. Gates for every further
+      refactor:
+      - `tools/test_refactor.cc` (against the frozen pre-refactor headers);
       - the full-sequence differential test (`tools/test_api.cc`, against the
         archived legacy build);
       - `tools/test_lp.cc` and `tools/test_lh.cc`;
@@ -540,53 +542,153 @@ type, and on overflow it simply throws. The fixed-type solvers
 `Solver64/128/MP/GMP` do exactly that. The `Solver` auto alias is an
 optional extra; keep it optional.
 
-## Open decisions (pending: the user will answer later)
+## Decisions (answered by the user, 2026-11-23)
 
-Until these are answered, keep the provisional defaults and do not switch
-`lib.h`.
+1. **`solve_fast` (constant-sum) default: `Mode::Any`**, the exact LP. The
+   value always equals legacy's. In degenerate games the strategies can
+   differ from legacy's "last" equilibrium; that is accepted.
+2. **`solve_full` (general-sum) default: `Mode::Any`**, Lemke-Howson. This
+   changes the provisional `Last`. It returns one exact equilibrium, usually
+   not the one legacy returns. `Last` (legacy-exact) and `First` stay
+   available as explicit modes.
+3. **Switching `lib.h`/CMake and deleting the legacy `.cc` files: not yet.**
+   Do the idiomatic-internals refactor (step 6.4) first, while `lib.h` stays
+   on legacy.
+4. **Type selection after the switch: one target, type in code.** A single
+   CMake INTERFACE target `lrsnash`. Callers pick the type in code
+   (`LRSNash::Solver64 s; s.solve_fast(...)`). Downstream call sites and
+   CMake will change when the switch happens; the four legacy target names
+   are not kept.
+5. **API extras: all three wanted.**
+   - a caller-chosen Lemke-Howson missing label (default label 1);
+   - exact rational output from `solve_all`;
+   - rational `num/den` payoff input (lcm scaling per player).
+6. **`solve_full` value convention: keep it**, as player 1's payoff / den.
+7. **Performance work: all three wanted.**
+   - per-call overhead (stack storage or size bounds) for the LP and LH
+     defaults;
+   - a branch-light `lrs_ratio`/`reverse` for Last/First;
+   - an AVX2 kernel, which must use runtime dispatch (see 8).
+8. **Downstream build flags: CMake Release**, which is `-O3 -DNDEBUG` with
+   no `-march`. Benchmark at `-O3 -DNDEBUG`. Code that needs AVX2/BMI2 must
+   use a target attribute plus runtime dispatch. The 2026-11-23 measurement:
+   `-O3` equals `-O2` within noise; `-march=native` gives 11% (LP), 30% (LH)
+   and 13% (Last) at 9x9 int64, and nothing at 15x15 int128.
 
-1. **Default for `solve_fast` (constant-sum).**
-   - `Mode::Any`, the exact LP (about 2 µs at 9x9). Provisional default.
-   - Or `Mode::Last`, the legacy-exact enumeration (about 618 µs).
+Earlier decision: the caller chooses the arithmetic type and overflow
+throws. The `Solver` auto alias stays as an optional extra (user,
+2026-11-23).
 
-   The LP returns an optimal strategy pair. In degenerate games with several
-   optimal strategies, that pair can differ from legacy's "last" equilibrium.
-   The value is always identical.
-2. **Default for `solve_full` (general-sum).**
-   - `Mode::Last`: exactly the legacy result, 618 µs at 9x9. Provisional
-     default.
-   - `Mode::First`: the first equilibrium in lrsnash order, 138 µs.
-   - `Mode::Any`: Lemke-Howson, 3.3 µs. It returns a different equilibrium,
-     and its worst-case path length is exponential.
-3. **Switching `lib.h` and CMake to the headers and deleting the legacy
-   `.cc` files** (C++ rewrite steps 6.1–6.3). Two questions: when to do it,
-   and how CMake target names map to arithmetic types. One option is to keep
-   `lrslib` (MP), `lrslib64`, `lrslib128` and `lrslibgmp` as INTERFACE
-   targets that each select a type.
+## Open questions (for the user)
 
-Smaller questions nobody has asked about yet (current behaviour in brackets):
-- Lemke-Howson missing label [fixed k0 = 1]: let the caller choose?
-- `solve_all` output [doubles]: exact rationals as well?
-- Rational `num/den` payoffs [not supported]: restore?
-- Optional performance work (see "Next steps") [not started]: pursue?
+The user decides these in batches (2026-11-23). Every open design or
+interface question goes here, as do decisions Claude took alone that the user
+may want to revisit. Work continues around them. When one is answered, move it
+to "Decisions" above.
 
-Already decided: the caller chooses the arithmetic type and overflow throws.
-The `Solver` auto alias stays as an optional extra (user, 2026-11-23).
+**Q1. Public API names** (raised by the user, 2026-11-23). *Status:* open,
+nothing renamed yet. *Blocks:* nothing (work continues under the current
+names), but it is better settled before the `lib.h` switch, and before Q2/Q3
+add more API.
+- Problem: `solve_fast` (constant-sum) and `solve_full` (general-sum) read as
+  "first equilibrium" and "all equilibria". The API has two independent axes:
+  - the game class: constant-sum or general-sum;
+  - the answer: one equilibrium (`Mode` chooses which) or all extreme
+    equilibria.
+
+  Today only 3 of the 4 combinations exist: there is no "all" for
+  constant-sum.
+- Recommended: one name per kind of answer, with the game class in the input
+  type (overloads):
+  ```cpp
+  solve(const ConstantSumGame*, FloatOneSumOutput*, Mode = Any);
+  solve(const GeneralSumGame*, FloatOneSumOutput*, Mode = Any, long missing_label = 0);
+  extreme_equilibria(const ConstantSumGame*);   // new combination
+  extreme_equilibria(const GeneralSumGame*);    // was solve_all
+  ```
+  The game class is a property of the input, so its type is the right place
+  for it. The algorithm follows from the game class plus `Mode`. `value` means
+  the same in both overloads (the row player's payoff / den). The constant-sum
+  "all" is nearly free: it is the enumeration that `Last` already runs on
+  `(data, den - data)`.
+- Alternative: put the game class in the name (`solve_constant_sum`,
+  `solve_general_sum`), plus two "all" names. Four names, combinatorial.
+- Sub-questions:
+  - **Q1a.** `constant_sum` or `zero_sum`? Recommend `constant_sum`: player 2's
+    payoff is `den - data`, not `-data`.
+  - **Q1b.** `extreme_equilibria` or `solve_all`? Recommend
+    `extreme_equilibria`: degenerate games can have infinitely many
+    equilibria, and only the extreme ones are returned.
+  - **Q1c.** Struct names. Make `FastInput` → `ConstantSumGame` and `Input` →
+    `GeneralSumGame` aliases in `solve.hpp` now, with the real definitions at
+    the `lib.h` switch. `FloatOneSumOutput` is also wrong for general-sum
+    games (the payoffs need not sum to one): rename it at the switch (e.g.
+    `FloatEquilibrium`) or keep it?
+  - **Q1d.** Units of the `extreme_equilibria` payoffs. Recommend dividing by
+    `den`, as `value` does. `solve_all` reports matrix units today, and only
+    `tools/` uses it.
+  - **Q1e.** (Noticed by Claude, not discussed.) Pointers (`const Game*`, as
+    legacy does) or references in the new API? Recommend keeping pointers
+    until the switch.
+  - `Mode {Any, First, Last}` is unchanged in both proposals.
+
+**Q2. Exact rational output for "all"** (decision 5 says wanted; its form is
+open). *Blocks:* that item of next step 4.
+- Inside, the results are already exact: numerators over a common
+  denominator, in the solver's type `T`.
+- Options:
+  - (a) a template visitor that gets `const T*` exactly as `nash.hpp` produces
+    them: no copies, works for all 4 types, but the caller deals with `T`;
+  - (b) return GMP rationals (puts GMP in the API);
+  - (c) fixed-width num/den pairs that throw on overflow;
+  - (d) strings: no (lean headers).
+- For the auto chain `Solver<I64, I128, GMP>`, `T` depends on which type
+  succeeded: either convert to the widest type, or call a generic-lambda
+  visitor with whatever type succeeded.
+- Recommend (a) with a generic lambda, and keep the double-valued convenience
+  call.
+
+**Q3. Rational payoff input** (decision 5 says wanted; its form is open).
+*Blocks:* that item of next step 4.
+- Inside: scale each player's matrix by the lcm of its denominators (best
+  responses do not change), then divide the reported payoffs back. If a
+  scaled entry does not fit in `long`, throw `overflow_error`.
+- Open:
+  - the input struct: `num`/`den` arrays per entry, or one denominator per
+    player?
+  - how it combines with today's scalar `den`, which both defines
+    constant-sum games and scales `value`.
+
+**Q4. Rejecting 0-size games** (decided by Claude, 2026-11-23; revisit if it
+matters). Every `solve_*` throws `invalid_argument` unless rows, cols >= 1.
+- This was not validated before. With `cols = 0` the old lrs code went down a
+  rank-deficient path (it computed rays).
+- Legacy `lib.h` never defined what 0 sizes do.
+- Revisit if downstream can pass empty games.
 
 ## Current status / next steps (handoff, 2026-11-23)
 **User preferences.**
 - Verify correctness by **static analysis against the paper and upstream
   source**. Randomized differential runs are secondary evidence.
 - The caller picks the arithmetic type explicitly.
+- Library headers stay lean: no `std::string` or similar (exception
+  messages are `const char*` literals).
+- Benchmark only on mains power with the `performance` power profile
+  (`powerprofilesctl get`); otherwise do no timing and keep test trial
+  counts low (a few hundred games).
 
 **State.**
-- Everything is committed on branch `rewrite`.
+- Sessions 4 and 5 are committed on `rewrite` in the commit after
+  `fff2737`. It is local only, not pushed; the user said "proceed". Later
+  work stays uncommitted until the user asks.
 - All tests pass:
   - `tools/test_lp.cc`, `tools/test_lh.cc`, `tools/test_api.cc`;
   - full-sequence equality with legacy for all 4 types;
-  - exact NE checks.
+  - exact NE checks;
+  - `tools/test_refactor.cc`: bit-identical to the pre-refactor headers.
 - The headers compile cleanly with g++ 15 and clang++ 21 at
-  `-Wall -Wextra`.
+  `-Wall -Wextra`, with and without `-DNDEBUG` (checked by building
+  `tools/bench.cc`, which instantiates every solver path).
 - `lib.h`/CMake still build only the legacy code.
 
 **Header-only code (`src/lrsnash/`).**
@@ -594,18 +696,23 @@ The `Solver` auto alias stays as an optional extra (user, 2026-11-23).
   the fast kernels (`pivot`, `tableau_pivot`, `pivot_safe`,
   `magnitude_bound`, `from_i64/i128`).
 - `lrs.hpp`: the lrs core (`Dict` and `Problem`), using the kernels and
-  `memcpy` copies.
-- `nash.hpp`: the lrsnash driver with a visitor (First, Last and All).
+  `memcpy` copies. Its header documents the dictionary layout, maps every
+  function to upstream, and lists the removed dead code with the reason
+  each piece is dead.
+- `nash.hpp`: the lrsnash driver with a visitor (First, Last and All). Its
+  header explains the two polyhedra and the label numbering.
 - `zerosum.hpp`: the LP, with `promote_from` for the auto chain.
 - `lemke.hpp`: Lemke-Howson.
 - `solve.hpp`: `SolverT<Ar...>` and its aliases. It provides:
   - `solve_fast(FastInput*, out, Mode = Any)`: `Any` is the LP, and `Last`
     is exactly legacy `solve_fast`;
-  - `solve_full(Input*, out, Mode = Last)`;
+  - `solve_full(Input*, out, Mode = Any, missing_label = 0)`: `Any` is
+    Lemke-Howson, and `Last` is exactly legacy `solve_full`;
   - `solve_all(rows, cols, A, B)`, which returns every extreme equilibrium
     with both payoffs.
 
-  It writes exactly `rows`/`cols` entries and has no globals.
+  It writes exactly `rows`/`cols` entries and has no globals. Every
+  `solve_*` throws `std::invalid_argument` unless `rows, cols >= 1`.
 
 **Functionality vs upstream 7.2.**
 - Kept: all-equilibria enumeration in upstream order, and all 4 arithmetic
@@ -615,28 +722,124 @@ The `Solver` auto alias stays as an optional extra (user, 2026-11-23).
   rational num/den payoffs (could be restored by lcm-scaling each player's
   matrix), CLI and I/O options, the `MAXSTRAT=200` cap, and `2nash`.
 
-**Next steps (in order).**
-1. Get answers to "Open decisions" 1–3.
-2. C++ rewrite: work plan step 6. Do API and build (6.1, 6.2) first, then
-   remove legacy (6.3) after archiving a legacy build for the differential
-   tests, then the idiomatic internals (6.4) gated by the tests and a static
-   review.
-3. Optional performance work:
+**Next steps (in order, per the 2026-11-23 decisions).**
+1. Done (session 4): small API changes. `solve_full` defaults to
+   `Mode::Any`, and the Lemke-Howson missing-label argument is added.
+2. Done (session 5): idiomatic internals (step 6.4) for `lrs.hpp` and
+   `nash.hpp`. `lib.h` stays on legacy meanwhile.
+3. Performance work (decision 7), benchmarked at `-O3 -DNDEBUG`.
+   **Blocked until timing is possible** (mains power and the `performance`
+   profile; the user said not to benchmark in session 5). First measure the
+   session-5 pool fix for Last/First, which was not timed:
+   - per-call overhead of the LP and LH (the defaults);
    - a branch-light `lrs_ratio`/`reverse` for the fixed-width types (P1
      reverse search is about half of Last-mode time);
-   - an AVX2 kernel behind a target attribute;
-   - a fixed 256/512-bit type for 30x30 and larger, where GMP dominates.
+   - an AVX2 kernel behind a target attribute with runtime dispatch.
+4. API extras: exact rational `solve_all` output, rational payoff input.
+   **Blocked on the interface questions Q2 and Q3.**
+5. Later, when the user says so: switch `lib.h` to one INTERFACE target
+   `lrsnash` with the type chosen in code (6.1, 6.2), archive legacy, then
+   delete it (6.3).
 
-   Caveat: Lemke-Howson has exponential worst-case paths (Savani–von
-   Stengel), though random games are short.
+**Progress (2026-11-23, session 4).**
+- Step 1 done: `solve_full` defaults to `Mode::Any`, with the
+  `missing_label` argument (0-based, `invalid_argument` if out of range).
+  `tools/test_lh.cc` checks it through the public API (0 mismatches).
+- `tools/test_api.cc` now checks `Last` against legacy's exact sequence.
+  It counts legacy's own float errors (`mptoi`) separately.
+- Step 2 (refactor) is designed but **not started in code**. Plan:
+  - one `pivot()` that also updates B/C positions;
+  - descriptive names, with an upstream mapping table;
+  - shared `start_basis`/`finish_basis` for player 1 and player 2;
+  - drop dead code: the ray/linearity-space output (nredundcol is always 0
+    by full column rank), `ismin` (dead with col 0), FillFirstRow, the
+    origin check, counters and `minratio[m]`.
+
+  Gate: compare exact outputs and pivot counts against a frozen copy of the
+  pre-refactor headers (namespace `LRSNashRef`; rebuild it from git if the
+  scratchpad copy is gone).
+- Found a perf bug for the refactor to fix: `Problem::init` clears the
+  dictionary pool on every solve, because `pool[0]->d_orig` was changed by
+  `resize`. So Last/First reallocate every dictionary each solve.
+- 50x50 constant-sum LP, payoffs 0..100, `-O3`:
+  - int64 and int128 overflow on every game;
+  - GMP 21.6 ms, auto 19.8 ms, lrsmp 133 ms;
+  - 30x30: auto 1.17 ms, GMP 2.09 ms;
+  - 50x50 Lemke-Howson: GMP 32 ms, auto 15.6 ms.
+
+**Progress (2026-11-23, session 5).**
+- Step 2 done. `lrs.hpp` went from 773 to 651 lines and `nash.hpp` from 455
+  to 272.
+  - `pivot()` now includes upstream's `update()`, and takes `long&`
+    instead of `long*`.
+  - Descriptive names, with an upstream mapping table in the header of
+    `lrs.hpp`.
+  - Player 1 and player 2 share `start_order`, `find_basis`,
+    `remove_linearity_columns` and `finish_basis`. P2 differs only in
+    saving `P2base` (was `P2orig`) between `find_basis` and the column
+    removal, and in the warm restart.
+  - Dead code is removed, each piece with its static reason in the header
+    of `lrs.hpp`: rays and redundant columns, `ismin`, the
+    `set_row`/`reducearray` gcd reductions, `FillFirstRow`, the origin
+    checks, `depth`/`MAXD`, `count[]` except pivots, `minratio[m]`, `m_A`,
+    `d_orig`, `Gcd`/`Lcm`, `temparray` and `reorder`.
+  - Kept on purpose: 1-based basis positions, because `B[0]` is the
+    objective row. That is the dictionary's structure, not a C habit.
+- Facts the removal relies on, which the code now enforces:
+  - No redundant column. Both systems have an identity block plus payoff
+    rows whose payoff-variable coefficient is 1, so the column rank is
+    `nvars` when `rows, cols >= 1`. `find_basis` throws `logic_error`
+    otherwise. The new `solve_*` dimension check makes that unreachable;
+    before, `cols = 0` was unvalidated and the old code computed a ray.
+  - Every input row has gcd at most 1 (upstream divides only by a gcd
+    above 1). This is a debug-only `assert` in `set_row`.
+- The pool bug is fixed: `init` now compares only `m` and `stride`. A
+  repeat solve of the same shape allocates no dictionary. This is checked
+  through `Nash::dict_allocations()` in `test_refactor`; a mutant with the
+  old behaviour fails 50 of 50 games. The speed gain is **not measured**
+  (no benchmarking this session).
+- One bug was made and fixed during the refactor, caught by the gate, not
+  by static review. The lookup of a linearity column must use the
+  *current* `d` (`r + P->d`): every removal shifts the higher indices down
+  by one, and upstream relies on that. Watch for this in later reviews of
+  index arithmetic.
+- New gate `tools/test_refactor.cc`. It checks the exact visitor event
+  sequence, early stop after 1-3 events, pivot count and overflow
+  behaviour against `fff2737` (namespace `LRSNashRef`), for all 4 types,
+  plus the repeat-solve check. Results:
+  - before the user asked for low counts: 25,000 games (maxdim 4, 9 and
+    14), ~7.8M pivots, 0 mismatches;
+  - after the final edits: 300-400 games, 0 mismatches.
+- Gate-script lesson: one build failed (`Nash::T_ar` was dropped, and
+  `solve.hpp` uses it), but the tests still "passed" by running the stale
+  binaries. The script must delete the old binaries and check every build's
+  exit status (see "How to re-verify").
+- A second static pass compared every function line by line with the
+  frozen reference. The points it needed:
+  - `ratio_test` now keeps `Nmin`/`Dmin` as pointers into `A`. This is
+    safe because every `comprod` takes `const&`, writes only member
+    temporaries, and each pass sets them at its first candidate.
+  - The warm restart skips upstream's zeroing of row 0. `P2base` is saved
+    with a zero row 0, and pivots keep a zero row zero.
+  - P1's "linearity not cobasic → fail" branch is unreachable.
+    `find_basis` brings only decision variables in, so after compaction
+    every remaining linearity is cobasic.
+
+Not planned: a fixed 256/512-bit type (only helps at 30x30 and larger; it
+is the item to revisit if 50x50 matters).
+Caveat: Lemke-Howson has exponential worst-case paths (Savani–von
+Stengel), though random games are short.
 
 **How to re-verify quickly** (repo root; legacy libraries from
-`cmake -S . -B build && cmake --build build`):
+`cmake -S . -B build && cmake --build build`). Delete old test binaries
+first and stop on any build error, so that stale binaries cannot pass:
 ```
 g++ -O2 -std=c++17 -Isrc tools/test_lp.cc build/liblrslib.a -lgmp -o test_lp && ./test_lp 3000 9 1 legacy
 g++ -O2 -std=c++17 -Isrc tools/test_lh.cc -lgmp -o test_lh && ./test_lh 1000 7 1
 python3 tools/instrument_legacy.py /tmp/legacy && (cd /tmp/legacy && for f in lib lrslib lrsgmp; do g++ -O2 -c -I. $f.cc -DGMP -w -fpermissive; done)
 g++ -O2 -std=c++17 -Isrc tools/test_api.cc /tmp/legacy/*.o -lgmp -o test_api && ./test_api 1000 8 1
+mkdir -p /tmp/ref/lrsnash_ref && for f in arith lrs nash; do git show fff2737:src/lrsnash/$f.hpp | sed 's/\bLRSNash\b/LRSNashRef/g' > /tmp/ref/lrsnash_ref/$f.hpp; done
+g++ -O2 -std=c++17 -Isrc -I/tmp/ref tools/test_refactor.cc -lgmp -o test_refactor && ./test_refactor 3000 9 1
 g++ -O2 -std=c++17 -Isrc tools/bench.cc -lgmp -o bench && ./bench 9 9 80 10000 100000001 fast auto
 ```
 Every mismatch count should be 0. The exception is the
@@ -651,6 +854,10 @@ shows rare mismatches on 9x9 games with payoffs 0..1000. Those are the legacy
   Lemke-Howson (kernel bit-identity, exact NE checks in GMP).
 - `test_api.cc` + `instrument_legacy.py`: solve.hpp vs the legacy library,
   checking full output sequences for all 4 types.
+- `test_refactor.cc`: `nash.hpp`/`lrs.hpp` vs the frozen pre-refactor
+  headers (`fff2737`). It checks exact events, pivots, early stop and
+  overflow, and that a repeat solve allocates nothing. Use it as the gate
+  for any further internal change.
 - Older tools (copies; the originals are in the session scratchpad):
 - `extract.py`: per-function normalized diff, run as
   `python3 extract.py upstream.c stripped.cc outdir`.

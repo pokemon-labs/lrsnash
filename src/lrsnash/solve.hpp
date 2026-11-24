@@ -26,11 +26,13 @@
 //     Last / First - the lrsnash enumeration, as for solve_full. Last is
 //             exactly the legacy solve_fast result.
 //   solve_full (general bimatrix), by Mode:
+//     Any (default) - one equilibrium by Lemke-Howson (lemke.hpp). The
+//             caller may choose the missing label; different labels can
+//             find different equilibria. Fastest, but the equilibrium is in
+//             general not the one legacy lrsnash returns.
 //     Last  - legacy behaviour exactly: lrsnash enumeration order, the last
 //             equilibrium found (nash.hpp).
 //     First - the first equilibrium in lrsnash order (early exit).
-//     Any   - one equilibrium by Lemke-Howson (lemke.hpp, missing label 1).
-//             Fastest, but which equilibrium it finds differs from lrsnash's.
 //   solve_all (general bimatrix): every extreme equilibrium, in upstream
 //     lrsnash's order, with both players' payoffs. This is upstream
 //     lrsnash's output.
@@ -39,6 +41,7 @@
 // value = player 1's payoff / den, as in legacy.
 #pragma once
 
+#include <stdexcept>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -127,9 +130,12 @@ template <class... Ars> class SolverT {
   //   Mode::Any (default) - one exact LP: an optimal strategy pair.
   //   Mode::Last / First  - legacy enumeration on (data, den - data); Last is
   //                         exactly the legacy solve_fast result.
+  // Every solve_* throws std::invalid_argument unless rows >= 1 and
+  // cols >= 1.
   void solve_fast(const FastInput *g, FloatOneSumOutput *out,
                   Mode mode = Mode::Any) {
     const long m = g->rows, n = g->cols;
+    check_dims(m, n, "solve_fast: rows and cols must be >= 1");
     const int *a = g->data;
     const long den = g->den;
     auto A = [a, n](long i, long j) { return (long)a[i * n + j]; };
@@ -144,17 +150,28 @@ template <class... Ars> class SolverT {
     out->value = (float)(v / g->den);
   }
 
+  // General bimatrix game: row_data is player 1's payoff, col_data player 2's.
+  //   Mode::Any (default) - one equilibrium by Lemke-Howson, dropping
+  //                         missing_label (0-based): 0..rows-1 is row
+  //                         strategy i = label, rows..rows+cols-1 is column
+  //                         strategy j = label - rows. Ignored by Last/First.
+  //   Mode::Last / First  - legacy enumeration; Last is exactly the legacy
+  //                         solve_full result.
+  // value = player 1's payoff / den, as in legacy.
   void solve_full(const Input *g, FloatOneSumOutput *out,
-                  Mode mode = Mode::Last) {
+                  Mode mode = Mode::Any, long missing_label = 0) {
     const long m = g->rows, n = g->cols;
+    check_dims(m, n, "solve_full: rows and cols must be >= 1");
     const int *a = g->row_data, *b = g->col_data;
     auto A = [a, n](long i, long j) { return (long)a[i * n + j]; };
     auto B = [b, n](long i, long j) { return (long)b[i * n + j]; };
     double v = 0;
     if (mode == Mode::Any) {
+      if (missing_label < 0 || missing_label >= m + n)
+        throw std::invalid_argument("solve_full: missing_label must be in [0, rows + cols)");
       attempt([&](auto &w) {
         w.lh.setup(m, n, A, B);
-        w.lh.run(1);
+        w.lh.run(missing_label + 1);  // lemke.hpp labels are 1-based
         v = w.lh.solve_float(out->row_strategy, out->col_strategy);
       });
     } else {
@@ -168,6 +185,7 @@ template <class... Ars> class SolverT {
   // lrsnash order. A and B are row-major rows x cols.
   std::vector<Equilibrium> solve_all(long rows, long cols, const int *A,
                                      const int *B) {
+    check_dims(rows, cols, "solve_all: rows and cols must be >= 1");
     std::vector<Equilibrium> all;
     auto FA = [A, cols](long i, long j) { return (long)A[i * cols + j]; };
     auto FB = [B, cols](long i, long j) { return (long)B[i * cols + j]; };
@@ -181,6 +199,12 @@ template <class... Ars> class SolverT {
   }
 
  private:
+  // The solvers need a real game. (nash.hpp's lrs systems also rely on it:
+  // with rows, cols >= 1 the payoff rows give them full column rank.)
+  static void check_dims(long rows, long cols, const char *msg) {
+    if (rows < 1 || cols < 1) throw std::invalid_argument(msg);
+  }
+
   // LP in type I; before a pivot that might not fit, promote the dictionary
   // to type I+1 and continue there (no work is repeated). Types that cannot
   // be converted from (bignums) restart in the next type instead.

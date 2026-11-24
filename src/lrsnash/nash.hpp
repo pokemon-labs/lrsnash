@@ -1,17 +1,34 @@
 // Header-only port of the lrsnash driver (src/lib.cc, upstream lrsnashlib.c,
 // derived from nash.c by Terje Lensberg). GPL v2 or later, see COPYING.
 //
-// Enumerates the vertices x of player 1's best-response polyhedron with lrs.
-// For each x it enumerates the vertices y of the face of player 2's
-// polyhedron given by the labels missing at x. Every (x, y) found is an
-// extreme equilibrium and is passed to a visitor. The pivot sequence is the
-// same as in upstream lrsnash, so the equilibria arrive in the same order.
+// For a bimatrix game with payoffs A (player 1, rows) and B (player 2,
+// columns), every extreme equilibrium is a pair of vertices of the two
+// best-response polyhedra (Avis, Rosenberg, Savani, von Stengel 2010):
+//   P1:  x >= 0,  v - (B^T x)_j >= 0 (j = 1..cols),  sum x = 1   (rows 1..m)
+//   P2:  u - (A y)_i >= 0 (i = 1..rows),  y >= 0,  sum y = 1
+// with the rows numbered so that row k of P1 and row k of P2 carry the same
+// label: rows 1..rows are row strategy i (x_i = 0 / i is a best response),
+// rows rows+1..rows+cols column strategy j, and row m = rows+cols+1 is the
+// equation sum = 1. lrs enumerates the vertices x of P1. For each x, the
+// labels x does not have (its slack rows with nonzero value) must be tight in
+// P2, so the vertices y of that face of P2 are enumerated with those rows as
+// extra equations. Every (x, y) found is an extreme equilibrium and is passed
+// to a visitor. The pivot sequence is the same as in upstream lrsnash, so the
+// equilibria arrive in the same order.
+//
+// Mapping to lib.cc: BuildRepP1Is1/BuildRepP1Is0 -> build_p1/build_p2,
+// nash2_main -> enumerate_face, the linearity loop at its top ->
+// face_linearities, lrs_getfirstbasis2 + getabasis2 -> p2_first_basis (first
+// call) or warm_restart + precheck_infeasible + finish_basis (later calls),
+// P2orig -> P2base, FirstTime -> !have_p2_base.
 //
 // Differences from lib.cc that do not change which equilibria are produced,
 // or their order:
 //  * Vertex outputs are not gcd-reduced (reducearray). Upstream reduces
 //    every player-1 vertex, but only uses it when an equilibrium is printed.
 //    The visitor gets unreduced numerators and the common denominator.
+//  * The origin checks are dropped: sum x = 1 (sum y = 1) is an equation of
+//    the system, so no vertex is the origin.
 //  * FirstTime, P2orig and linindex are members, not globals.
 //  * The visitor can stop the enumeration early.
 #pragma once
@@ -26,20 +43,22 @@ namespace LRSNash {
 namespace detail {
 
 template <class Ar> struct Nash {
-  using T_ar = Ar;
+  using T_ar = Ar;  // used by solve.hpp
   using T = typename Ar::T;
   using D = Dict<Ar>;
   using P = Problem<Ar>;
 
   Ar ar;
   P Q1, Q2;
-  D *P1 = nullptr, *P2orig = nullptr;
-  std::vector<long> linindex;
-  std::vector<T> output1, output2;
-  std::vector<long> num;
-  std::vector<char> mark;
-  std::vector<long> undo;  // warm-restart pivots (basis pos, cobasis pos)
-  bool FirstTime = true;
+  D *P1 = nullptr;
+  // P2's dictionary after the first successful basis search, with the
+  // linearity columns still present; the starting point of every later
+  // face (upstream P2orig).
+  D *P2base = nullptr;
+  bool have_p2_base = false;  // upstream !FirstTime
+  std::vector<char> is_lin;   // is_lin[k]: slack k is a face equation
+  std::vector<T> out1, out2;
+  std::vector<long> undo;     // warm-restart pivots (basis pos, cobasis pos)
   bool stop = false;
 
   // Visitor interface:
@@ -48,174 +67,182 @@ template <class Ar> struct Nash {
   //                                      Return false to stop.
   //   bool on_eq1(const T *x, long n1)   x of the P1 vertex that produced at
   //                                      least one equilibrium (called after
-  //                                      its on_eq2 calls), x[rows+1] =
-  //                                      player 2's payoff. Return false to
-  //                                      stop.
+  //                                      its on_eq2 calls, also when one of
+  //                                      them stopped), x[rows+1] = player
+  //                                      2's payoff. Return false to stop.
   // A(i, j) / B(i, j): payoffs of players 1 and 2 (0-based, i row, j col).
   template <class PayA, class PayB, class Visit>
   void solve(long rows, long cols, PayA A, PayB B, Visit &visit) {
-    FirstTime = true;
+    have_p2_base = false;
     stop = false;
-    num.resize(std::max(rows, cols) + 2);
+    build_p1(rows, cols, B);
+    build_p2(rows, cols, A);
+    is_lin.assign(Q2.m + Q2.nvars + 2, 0);
+    out1.resize(Q1.n);
+    out2.resize(Q2.n);
 
-    Q1.init(&ar, rows + cols + 1, rows + 2);
-    P1 = Q1.lrs_alloc_dic();
-    // BuildRepP1Is1: x_i >= 0, then v - (B^T x)_j >= 0, then sum x = 1
-    FillNonnegativityRows(Q1, P1, 1, rows);
-    for (long row = rows + 1; row < rows + 1 + cols; row++) {
-      long s = row - (rows + 1);
-      num[0] = 0;
-      for (long t = 0; t < rows; t++) num[t + 1] = -(long)B(t, s);
-      num[rows + 1] = 1;
-      Q1.set_row(P1, row, num.data(), false);
-    }
-    FillLinearityRow(Q1, P1);
-    FillFirstRow(Q1, P1);
-
-    Q2.init(&ar, rows + cols + 1, cols + 2);
-    P2orig = Q2.lrs_alloc_dic();
-    // BuildRepP1Is0: u - (A y)_i >= 0, then y_j >= 0, then sum y = 1
-    for (long row = 1; row < 1 + rows; row++) {
-      long s = row - 1;
-      num[0] = 0;
-      for (long t = 0; t < cols; t++) num[t + 1] = -(long)A(s, t);
-      num[cols + 1] = 1;
-      Q2.set_row(P2orig, row, num.data(), false);
-    }
-    FillNonnegativityRows(Q2, P2orig, rows + 1, rows + cols);
-    FillLinearityRow(Q2, P2orig);
-    FillFirstRow(Q2, P2orig);
-
-    linindex.assign(P2orig->m + P2orig->d + 2, 0);
-    output1.resize(Q1.n + Q1.m);
-    output2.resize(Q1.n + Q1.m);
-
-    if (!Q1.lrs_getfirstbasis(P1))
-      throw std::logic_error("lrs_getfirstbasis failed");
-
-    long col = Q1.nredundcol;
+    if (!Q1.first_basis(P1)) throw std::logic_error("lrsnash: player 1 has no first basis");
     do {
-      if (Q1.lrs_getsolution(P1, output1, col, false)) {
-        long found = 0;
-        nash2_main(visit, found);
-        if (found > 0) {
-          if (!origin(Q1, output1) && !visit.on_eq1(output1.data(), Q1.n))
-            stop = true;
-        }
-        if (stop) break;
-      }
-    } while (Q1.lrs_getnextbasis(P1));
-    Q1.free_ring(P1);
+      if (!Q1.get_vertex(P1, out1)) continue;
+      if (enumerate_face(visit) > 0 && !visit.on_eq1(out1.data(), Q1.n)) stop = true;
+      if (stop) break;
+    } while (Q1.next_basis(P1));
+    Q1.release_ring(P1);
   }
 
-  static bool origin(const P &Q, const std::vector<T> &out) {
-    for (long i = 1; i < Q.n; i++)
-      if (!Ar::zero(out[i])) return false;
-    return true;
-  }
+  // pivots done by the last solve (both players), for tests and benchmarks
+  long pivot_count() const { return Q1.pivots + Q2.pivots; }
+  // dictionaries allocated so far (cumulative). A repeat solve of the same
+  // shape reuses the pool and allocates none.
+  std::size_t dict_allocations() const { return Q1.dicts_allocated + Q2.dicts_allocated; }
 
   // ------------------------------------------------------------ input rows
-  void FillNonnegativityRows(P &Q, D *Pd, long firstRow, long lastRow) {
-    long n = Q.n;
-    for (long row = firstRow; row <= lastRow; row++) {
-      num[0] = 0;
-      for (long col = 1; col < n; col++)
-        num[col] = (row - firstRow + 1 == col) ? 1 : 0;
-      Q.set_row(Pd, row, num.data(), false);
-    }
+  // upstream BuildRepP1Is1: variables x_1..x_rows, v (column rows+1)
+  template <class PayB> void build_p1(long rows, long cols, PayB &B) {
+    const long m = rows + cols + 1;
+    Q1.init(&ar, m, rows + 2);
+    P1 = Q1.initial_dict();
+    for (long r = 1; r <= rows; r++)  // x_r >= 0
+      Q1.set_row(P1, r, [r](long c) { return c == r ? 1L : 0L; }, false);
+    for (long s = 0; s < cols; s++)  // v - sum_t B(t, s) x_t >= 0
+      Q1.set_row(P1, rows + 1 + s, [&, s](long c) {
+        return c == 0 ? 0L : c <= rows ? -(long)B(c - 1, s) : 1L;
+      }, false);
+    set_sum_row(Q1, P1);
   }
-  void FillLinearityRow(P &Q, D *Pd) {
-    long n = Q.n;
-    num[0] = -1;
-    for (long i = 1; i < n - 1; i++) num[i] = 1;
-    num[n - 1] = 0;
-    Q.set_row(Pd, Q.m, num.data(), true);
+
+  // upstream BuildRepP1Is0: variables y_1..y_cols, u (column cols+1)
+  template <class PayA> void build_p2(long rows, long cols, PayA &A) {
+    const long m = rows + cols + 1;
+    Q2.init(&ar, m, cols + 2);
+    P2base = Q2.initial_dict();
+    for (long s = 0; s < rows; s++)  // u - sum_t A(s, t) y_t >= 0
+      Q2.set_row(P2base, 1 + s, [&, s](long c) {
+        return c == 0 ? 0L : c <= cols ? -(long)A(s, c - 1) : 1L;
+      }, false);
+    for (long r = 1; r <= cols; r++)  // y_r >= 0
+      Q2.set_row(P2base, rows + r, [r](long c) { return c == r ? 1L : 0L; }, false);
+    set_sum_row(Q2, P2base);
   }
-  void FillFirstRow(P &Q, D *Pd) {
-    for (long i = 0; i < Q.n; i++) num[i] = 1;
-    Q.set_row(Pd, 0, num.data(), false);
+
+  // row m: -1 + sum of the strategy variables = 0
+  static void set_sum_row(P &Q, D *Pd) {
+    const long last = Q.nvars;  // the payoff variable
+    Q.set_row(Pd, Q.m, [last](long c) { return c == 0 ? -1L : c < last ? 1L : 0L; }, true);
   }
 
   // ------------------------------------------------------------ player 2
-  //
-  // Same decisions as lib.cc nash2_main, organised to avoid work in the
-  // common case. After the first successful getabasis2 (FirstTime false),
-  // upstream does: P2 = copy(P2orig); warm-restart pivots on P2;
-  // P2orig = copy(P2); remove the linearity columns of P2; primalfeasible(P2).
-  // In about 98% of calls (random 9x9 games) primalfeasible fails at its
-  // first step, with no pivot. Here the warm-restart pivots are applied to
-  // P2orig in place (undone if getabasis2 would fail, which leaves P2orig
-  // unchanged as upstream does), and primalfeasible's first step is evaluated
-  // read-only on P2orig with the linearity columns skipped. P2 is copied and
-  // reduced only if the face may be nonempty. The dictionaries, and so every
-  // later decision, are identical to upstream's.
-  template <class Visit> void nash2_main(Visit &visit, long &numequilib) {
-    compute_linearities();
-    D *P2;
-    if (FirstTime) {
-      P2 = Q2.lrs_getdic();
-      Q2.copy_dict(P2, P2orig);
-      if (!lrs_getfirstbasis2(P2)) {
-        Q2.free_ring(P2);
-        return;
-      }
-    } else {
-      if (!warm_restart_inplace()) return;    // getabasis2 FALSE
-      if (precheck_infeasible()) return;      // primalfeasible FALSE, no pivot
-      P2 = Q2.lrs_getdic();
-      Q2.copy_dict(P2, P2orig);
-      remove_linearities(P2);
-      if (!finish_firstbasis2(P2)) {
-        Q2.free_ring(P2);
-        return;
-      }
+  // The face equations for the current P1 vertex: every P1 slack that is
+  // basic with a nonzero value (a label x does not have), plus sum y = 1.
+  // Upstream sorts them with nlinearity-1 passes of reorder(), which is a
+  // full sort of these distinct row numbers.
+  void face_linearities() {
+    std::vector<long> &lin = Q2.linearity;
+    lin.clear();
+    const long *B = P1->B.data(), *Row = P1->Row.data();
+    const long first_lin = Q1.linearity.empty() ? 0 : Q1.linearity[0];
+    for (long i = Q1.nvars + 1; i <= P1->m; i++) {
+      if (ar.zero(P1->a(Row[i], 0))) continue;
+      const long r = Q1.slack_row[B[i] - Q1.nvars];
+      if (Q1.linearity.empty() || r < first_lin) lin.push_back(r);
     }
-    do {
-      if (Q2.lrs_getsolution(P2, output2, 0, false)) {
-        if (!origin(Q2, output2)) {
-          numequilib++;
-          if (!visit.on_eq2(output2.data(), Q2.n)) {
-            stop = true;
-            break;
-          }
-        }
-      }
-    } while (Q2.lrs_getnextbasis(P2));
-    Q2.free_ring(P2);
+    if (!Q1.linearity.empty()) lin.push_back(first_lin);
+    std::sort(lin.begin(), lin.end());
   }
 
-  // !FirstTime branch of getabasis2, applied to P2orig in place. Returns
-  // false (with P2orig restored exactly) where upstream returns FALSE. The
+  // upstream nash2_main: enumerate the vertices y of the face of P2 for the
+  // current P1 vertex; returns how many were reported.
+  //
+  // Upstream, after the first successful basis search, does for every face:
+  // P2 = copy(P2orig); warm-restart pivots on P2; P2orig = copy(P2); remove
+  // the linearity columns of P2; primalfeasible(P2). In about 98% of calls
+  // (random 9x9 games) primalfeasible fails at its first step, with no pivot.
+  // Here the warm-restart pivots are applied to P2base in place (undone if
+  // upstream's getabasis2 would fail, which leaves P2orig unchanged as
+  // upstream does), and primalfeasible's first step is evaluated read-only
+  // on P2base with the linearity columns skipped. P2 is copied and reduced
+  // only if the face may be nonempty. The dictionaries, and so every later
+  // decision, are identical to upstream's.
+  template <class Visit> long enumerate_face(Visit &visit) {
+    face_linearities();
+    D *P2;
+    if (!have_p2_base) {
+      P2 = Q2.new_ring();
+      Q2.copy_dict(P2, P2base);
+      if (!p2_first_basis(P2)) {
+        Q2.release_ring(P2);
+        return 0;
+      }
+    } else {
+      if (!warm_restart()) return 0;          // upstream getabasis2 FALSE
+      if (precheck_infeasible()) return 0;    // primalfeasible FALSE, no pivot
+      P2 = Q2.new_ring();
+      Q2.copy_dict(P2, P2base);
+      Q2.remove_linearity_columns(P2);
+      if (!Q2.finish_basis(P2, false)) {
+        Q2.release_ring(P2);
+        return 0;
+      }
+    }
+    long found = 0;
+    do {
+      if (!Q2.get_vertex(P2, out2)) continue;
+      ++found;
+      if (!visit.on_eq2(out2.data(), Q2.n)) {
+        stop = true;
+        break;
+      }
+    } while (Q2.next_basis(P2));
+    Q2.release_ring(P2);
+    return found;
+  }
+
+  // lib.cc lrs_getfirstbasis2 with getabasis2's FirstTime branch: as
+  // Problem::first_basis, but the dictionary is saved as P2base before the
+  // linearity columns are removed (even if primalfeasible then fails). Q2's
+  // slack_row is not maintained: only player 1's is read.
+  bool p2_first_basis(D *&Dp) {
+    Q2.start_order(Q2.slack_row.data());
+    for (long j = 0; j <= Dp->d; j++) ar.set(Dp->a(0, j), 0);
+    if (!Q2.find_basis(Dp, Q2.slack_row.data())) return false;
+    have_p2_base = true;
+    Q2.copy_dict(P2base, Dp);
+    Q2.remove_linearity_columns(Dp);
+    return Q2.finish_basis(Dp, false);
+  }
+
+  // getabasis2's !FirstTime branch, applied to P2base in place: pivot each
+  // basic face-equation slack out, if a non-equation cobasic column allows
+  // it. Returns false (with P2base restored exactly) where upstream returns
+  // FALSE: a basic equation slack that cannot leave and is nonzero. The
   // integer pivot is an involution: pivoting again on the same entering /
   // leaving pair restores A, det, B, C, Row and Col exactly.
-  bool warm_restart_inplace() {
-    D *Pd = P2orig;
-    long *B = Pd->B.data(), *C = Pd->C.data(), *Row = Pd->Row.data(),
-         *Col = Pd->Col.data();
-    const long *linearity = Q2.linearity.data();
-    const long m = Pd->m, d = Pd->d, nlinearity = Q2.nlinearity;
-    // upstream zeroes row 0 of the copy before getabasis2; after the first
-    // successful call P2orig's row 0 is already zero, so this is a no-op
-    for (long j = 0; j <= d; j++) ar.set(Pd->a(0, j), 0);
-    for (long i = 1; i <= m + d; i++) linindex[i] = 0;
-    for (long i = 0; i < nlinearity; i++) linindex[d + linearity[i]] = 1;
+  //
+  // P2base's row 0 is zero (it was saved before finish_basis wrote the
+  // objective, and pivots keep a zero row zero), so upstream's zeroing of
+  // row 0 here is a no-op and is skipped.
+  bool warm_restart() {
+    D *Pd = P2base;
+    const long *B = Pd->B.data(), *C = Pd->C.data(), *Row = Pd->Row.data(),
+               *Col = Pd->Col.data();
+    const long m = Pd->m, d = Pd->d;  // d = nvars: no column was removed
+    std::fill(is_lin.begin(), is_lin.end(), 0);
+    for (long r : Q2.linearity) is_lin[d + r] = 1;
     undo.clear();
     for (long i = 1; i <= m; i++) {
-      if (!linindex[B[i]]) continue;
+      if (!is_lin[B[i]]) continue;
       long k = 0;
-      while (k < d && (linindex[C[k]] || ar.zero(Pd->a(Row[i], Col[k])))) k++;
+      while (k < d && (is_lin[C[k]] || ar.zero(Pd->a(Row[i], Col[k])))) k++;
       if (k < d) {
         long j = i;
-        if (C[k] > B[j]) i--;
+        if (C[k] > B[j]) i--;  // the entering variable sorts below: revisit i
         Q2.pivot(Pd, j, k);
-        Q2.update(Pd, &j, &k);
         undo.push_back(j);
         undo.push_back(k);
       } else if (!ar.zero(Pd->a(Row[i], 0))) {
         for (long u = (long)undo.size() - 2; u >= 0; u -= 2) {
           long uj = undo[u], uk = undo[u + 1];
           Q2.pivot(Pd, uj, uk);
-          Q2.update(Pd, &uj, &uk);
         }
         return false;
       }
@@ -223,229 +250,20 @@ template <class Ar> struct Nash {
     return true;
   }
 
-  // primalfeasible's first step on the dictionary that getabasis2 would
-  // produce from P2orig (cobasic linearity columns removed): true iff it
-  // would return FALSE without pivoting. Removing columns does not change
-  // the basis order, Row, or the order of the remaining cobasic columns.
+  // primalfeasible's first step on the dictionary that remove_linearity_
+  // columns would produce from P2base: true iff it would return false
+  // without pivoting. Removing columns does not change the basis order,
+  // Row, or the order of the remaining cobasic columns.
   bool precheck_infeasible() {
-    D *Pd = P2orig;
+    const D *Pd = P2base;
     const long m = Pd->m, d = Pd->d;
-    const long *Row = Pd->Row.data(), *Col = Pd->Col.data(),
-               *C = Pd->C.data();
-    long i = Q2.lastdv + 1;
+    const long *Row = Pd->Row.data(), *Col = Pd->Col.data(), *C = Pd->C.data();
+    long i = Q2.nvars + 1;
     while (i <= m && !ar.negative(Pd->a(Row[i], 0))) i++;
     if (i > m) return false;  // already primal feasible
     for (long k = 0; k < d; k++)
-      if (!linindex[C[k]] && ar.positive(Pd->a(Row[i], Col[k])))
+      if (!is_lin[C[k]] && ar.positive(Pd->a(Row[i], Col[k])))
         return false;  // primalfeasible would pivot
-    return true;
-  }
-
-  // tail of getabasis2: remove the cobasic linearity columns
-  void remove_linearities(D *Pd) {
-    const long *C = Pd->C.data();
-    const long *linearity = Q2.linearity.data();
-    long d = Pd->d;
-    for (long i = 0; i < Q2.nlinearity; i++) {
-      long k = 0;
-      while (k < d && C[k] != linearity[i] + d) k++;
-      if (k < d) {
-        Q2.removecobasicindex(Pd, k);
-        d = Pd->d;
-      }
-    }
-  }
-
-  // lrs_getfirstbasis2 after getabasis2. The renumbering of Q2.inequality is
-  // skipped: Q2.inequality is only read in the FirstTime branch, where it is
-  // rebuilt first.
-  bool finish_firstbasis2(D *&Dp) {
-    long i, j;
-    const long m = Dp->m;
-    const long nredundcol = Q2.nredundcol;
-    long d = Dp->d;
-    if (nredundcol > 0) {
-      std::vector<T> lin(Q2.n);
-      for (i = 0; i < nredundcol; i++) {
-        Q2.lrs_getray(Dp, Dp->Col[0], Dp->C[0] + i, lin);
-        if (!Q2.removecobasicindex(Dp, 0L)) return false;
-      }
-      d = Dp->d;
-    }
-    if (!Q2.primalfeasible(Dp)) return false;
-    for (j = 1; j <= d; j++) {
-      ar.copy(Dp->a(0, j), Dp->det);
-      ar.storesign(Dp->a(0, j), -1);
-    }
-    ar.set(Dp->a(0, 0), 0);
-    Dp->bound = ~(std::uint64_t)0;
-    long *B = Dp->B.data(), *C = Dp->C.data();
-    while (C[0] <= m) {
-      i = C[0];
-      C[0] = B[i];
-      B[i] = i;
-      P::reorder1(C, Dp->Col.data(), 0, d);
-    }
-    if (Q2.n - 1 > Dp->d) Dp = Q2.resize(Dp);
-    return true;
-  }
-
-  void compute_linearities() {
-    long *linearity = Q2.linearity.data();
-    long nlinearity = 0;
-    for (long i = Q1.lastdv + 1; i <= P1->m; i++) {
-      if (!ar.zero(P1->a(P1->Row[i], 0))) {
-        long j = Q1.inequality[P1->B[i] - Q1.lastdv];
-        if (Q1.nlinearity == 0 || j < Q1.linearity[0])
-          linearity[nlinearity++] = j;
-      }
-    }
-    if (Q1.nlinearity > 0) linearity[nlinearity++] = Q1.linearity[0];
-    // upstream calls reorder() nlinearity-1 times: a full sort of distinct
-    // row indices
-    std::sort(linearity, linearity + nlinearity);
-    Q2.nlinearity = nlinearity;
-  }
-
-  // lib.cc lrs_getfirstbasis2 (Lin is not needed and dropped)
-  bool lrs_getfirstbasis2(D *&Dp) {
-    long i, j, k;
-    long m = Dp->m, d = Dp->d;
-    long nlinearity = Q2.nlinearity;
-    long *linearity = Q2.linearity.data();
-    long *inequality = Q2.inequality.data();
-    long nredundcol;
-
-    // linearities first, then the other rows m..1 (upstream does this with
-    // a quadratic search)
-    mark.assign(m + 1, 0);
-    for (i = 0; i < nlinearity; i++) {
-      inequality[i] = linearity[i];
-      mark[linearity[i]] = 1;
-    }
-    k = nlinearity;
-    for (i = m; i >= 1; i--)
-      if (!mark[i]) inequality[k++] = i;
-    for (j = 0; j <= d; j++) ar.set(Dp->a(0, j), 0);
-
-    if (!getabasis2(Dp, inequality)) return false;
-
-    nredundcol = Q2.nredundcol;
-    d = Dp->d;
-
-    for (i = 1; i <= m; i++) inequality[i] = i;
-    if (nlinearity > 0) {
-      for (i = 0; i < nlinearity; i++) inequality[linearity[i]] = 0;
-      k = 1;
-      for (i = 1; i <= m - nlinearity; i++) {
-        while (k <= m && inequality[k] == 0) k++;
-        inequality[i] = inequality[k++];
-      }
-    }
-    if (nredundcol > 0) {
-      std::vector<T> lin(Q2.n);
-      for (i = 0; i < nredundcol; i++) {
-        Q2.lrs_getray(Dp, Dp->Col[0], Dp->C[0] + i, lin);
-        if (!Q2.removecobasicindex(Dp, 0L)) return false;
-      }
-    }
-    if (!Q2.primalfeasible(Dp)) return false;
-
-    for (j = 1; j <= d; j++) {
-      ar.copy(Dp->a(0, j), Dp->det);
-      ar.storesign(Dp->a(0, j), -1);
-    }
-    ar.set(Dp->a(0, 0), 0);
-    Dp->bound = ~(std::uint64_t)0;
-
-    long *B = Dp->B.data(), *C = Dp->C.data();
-    while (C[0] <= m) {
-      i = C[0];
-      C[0] = B[i];
-      B[i] = i;
-      P::reorder1(C, Dp->Col.data(), 0, d);
-    }
-    if (Q2.n - 1 > Dp->d) Dp = Q2.resize(Dp);
-    return true;
-  }
-
-  // lib.cc getabasis2
-  bool getabasis2(D *Pd, long order[]) {
-    long i, j, k;
-    long *B = Pd->B.data(), *C = Pd->C.data(), *Row = Pd->Row.data(),
-         *Col = Pd->Col.data();
-    long *linearity = Q2.linearity.data();
-    long *redundcol = Q2.redundcol.data();
-    long m = Pd->m, d = Pd->d;
-    long nlinearity = Q2.nlinearity;
-    long nredundcol = 0;
-
-    if (!FirstTime) {
-      for (i = 1; i <= m + d; i++) linindex[i] = 0;
-      for (i = 0; i < nlinearity; i++) linindex[d + linearity[i]] = 1;
-
-      for (i = 1; i <= m; i++) {
-        if (linindex[B[i]]) {
-          k = 0;
-          while (k < d && (linindex[C[k]] || ar.zero(Pd->a(Row[i], Col[k]))))
-            k++;
-          if (k < d) {
-            j = i;
-            if (C[k] > B[j]) i--;
-            Q2.pivot(Pd, j, k);
-            Q2.update(Pd, &j, &k);
-          } else {
-            if (!ar.zero(Pd->a(Row[i], 0))) return false;
-          }
-        }
-      }
-    } else {
-      for (j = 0; j < m; j++) {
-        i = 0;
-        while (i <= m && B[i] != d + order[j]) i++;
-        if (j < nlinearity && i > m) return false;
-        if (i <= m) {
-          k = 0;
-          while (C[k] <= d && ar.zero(Pd->a(Row[i], Col[k]))) k++;
-          if (C[k] <= d) {
-            Q2.pivot(Pd, i, k);
-            Q2.update(Pd, &i, &k);
-          } else if (j < nlinearity) {
-            if (ar.zero(Pd->a(Row[i], 0)))
-              linearity[j] = 0;
-            else
-              return false;
-          }
-        }
-      }
-      i = 0;
-      k = 0;
-      while (k < nlinearity) {
-        while (k < nlinearity && linearity[k] == 0) k++;
-        if (k < nlinearity) linearity[i++] = linearity[k++];
-      }
-      nlinearity = i;
-      Q2.nlinearity = i;
-      k = 0;
-      while (k < d && C[k] <= d) {
-        if (C[k] <= d) redundcol[nredundcol++] = C[k];
-        k++;
-      }
-      Q2.nredundcol = nredundcol;
-      Q2.lastdv = d - nredundcol;
-      FirstTime = false;
-    }
-
-    Q2.copy_dict(P2orig, Pd);
-
-    for (i = 0; i < nlinearity; i++) {
-      k = 0;
-      while (k < d && C[k] != linearity[i] + d) k++;
-      if (k < d) {
-        Q2.removecobasicindex(Pd, k);
-        d = Pd->d;
-      }
-    }
     return true;
   }
 };

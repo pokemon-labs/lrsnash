@@ -1,32 +1,85 @@
-// Header-only, global-free port of the parts of lrslib 7.2 used by lrsnash.
+// Header-only, global-free port of the parts of lrslib 7.2 used by lrsnash:
+// lexicographic reverse search over the vertices of one polyhedron.
 //
 // Derived from lrslib.c / lrslib.h, Copyright David Avis 2005-2022 and
 // contributors (Bremner's dictionary cache, Lensberg's nash driver).
 // GPL v2 or later, see COPYING.
 //
-// Mapping to upstream:
-//   lrs_dic  -> Dict<Ar>       (one dictionary; A stored row-major)
-//   lrs_dat  -> Problem<Ar>    (problem data + dictionary cache + counters)
-//   all file-level globals (dict_count, dict_limit, lrs_global_list, ...)
-//   live inside Problem.
+// ----------------------------------------------------------------- model
+// A Problem is the system  b_r + sum_c a_rc x_c >= 0  (r = 1..m), with
+// variables x_1..x_nvars, where nvars = n - 1, plus the equations listed in
+// `linearity`. Each row r has a slack variable with index nvars + r. In a
+// dictionary (Dict) every variable is either basic or cobasic:
+//   B[0..m]   basic variable indices, sorted. B[0] = 0 is the objective row.
+//   Row[i]    the row of A that holds the basic variable B[i].
+//   C[0..d-1] cobasic variable indices, sorted; C[d] is a sentinel
+//             (m + nvars + 1) that stops searches.
+//   Col[j]    the column of A that holds the cobasic variable C[j].
+//   A         (m + 1) x stride integers, row major. Row Row[i] is the
+//             equation of B[i] in the cobasic variables; column 0 is the
+//             right-hand side. Row 0 is the objective.
+//   det       the common denominator: every entry of A is a numerator
+//             over det (integer pivoting keeps A integral).
+// d starts at nvars and drops by one for every column removed (cobasic
+// linearity slacks). After the first basis, x_1..x_nvars are basic at
+// positions 1..nvars (they are the smallest indices), so the current vertex
+// is  x_k = A[Row[k]][0] / det.
 //
-// Only the code paths reachable from lrsnash are kept. That means no hull,
-// voronoi, nonnegative, maximize/minimize, bound, restart, givenstart or
-// extract options, and nothing is printed. Function names follow upstream so
-// that the two can be compared side by side.
+// ------------------------------------------------- mapping to upstream
+//   lrs_dic / lrs_dat             Dict / Problem (all file-level globals,
+//                                 e.g. dict_count, live inside Problem)
+//   lrs_alloc_dat, lrs_alloc_dic  init, initial_dict
+//   lrs_getdic                    new_ring
+//   copy_dict, pushQ, cache_dict  copy_dict, cache_push, cache_dict
+//   check_cache                   restore_cached
+//   resize                        reset_ring
+//   lrs_free_dic                  release_ring
+//   lrs_set_row_mp                set_row
+//   pivot + update                pivot (always called as a pair upstream)
+//   reorder1                      resort
+//   lrs_ratio                     ratio_test
+//   lexmin(P, 0)                  lexmin
+//   reverse                       is_reverse_pivot
+//   selectpivot                   select_pivot
+//   primalfeasible                make_primal_feasible
+//   removecobasicindex            remove_cobasic
+//   getabasis                     find_basis + remove_linearity_columns
+//   lrs_getfirstbasis             first_basis (= start_order, find_basis,
+//                                 remove_linearity_columns, finish_basis)
+//   lrs_getnextbasis              next_basis
+//   lrs_getsolution(P, out, 0)    get_vertex (lrs_getvertex)
+//   inequality                    slack_row
+//   count[3]                      pivots
 //
-// Notable simplifications that do not change results:
-//  * objnum/objden are not maintained by pivot(). Upstream only prints them.
-//  * Dictionaries come from a per-Problem pool and are never freed during a
-//    solve. resize() is a no-op because every dictionary is allocated at the
-//    full size.
+// ------------------------------------------- what is left out, and why
+// Only the code reachable from lrsnash is kept: no hull, voronoi,
+// nonnegative, maximize/minimize, bound, restart, givenstart or extract
+// options, and nothing is printed. The following upstream code is dead for
+// the lrsnash systems (see nash.hpp for their shape) and is removed:
+//  * Redundant columns and rays (lrs_getray, the ismin branch of lexmin,
+//    lrs_getsolution with col != 0). Both players' systems contain an
+//    identity block (x_i >= 0, y_j >= 0), so the columns have full rank and
+//    getabasis finds no redundant column; lastdv is always nvars.
+//    find_basis checks this and throws std::logic_error if it ever fails.
+//  * The gcd/lcm reduction of input rows (lrs_set_row_mp). Every lrsnash
+//    row has an entry of +-1, so the row gcd is 1 and nothing is divided.
+//  * The output gcd reduction (reducearray): lrsnash wants unreduced
+//    numerators over det.
+//  * depth and the MAXD depth limits (9.2e18, never reached), every count[]
+//    except the pivot count, minratio[m], objnum/objden, m_A (always m) and
+//    d_orig.
+// Dictionaries come from a per-Problem pool, all at full size, and are
+// reused across solves of the same shape.
 #pragma once
 
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <numeric>
+#include <stdexcept>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "arith.hpp"
@@ -36,63 +89,73 @@ namespace detail {
 
 template <class Ar> struct Dict {
   using T = typename Ar::T;
-  std::vector<T> A;  // (m_A+1) x (stride) row major
-  long stride = 0;
-  long m = 0, m_A = 0, d = 0, d_orig = 0;
-  long lexflag = 1, depth = 0, i = 0, j = 0;
-  T det;
-  // magnitude hint for the fixed-width pivot kernels (see arith.hpp);
-  // ~0 means unknown. Set to ~0 after any direct write to A.
-  std::uint64_t bound = ~(std::uint64_t)0;
-  std::vector<long> B, Row, C, Col;
-  Dict *prev = this, *next = this;
+  static constexpr std::uint64_t kUnknownBound = ~(std::uint64_t)0;
 
-  Dict(long m_, long d_, long m_A_)
-      : A((m_A_ + 1) * (d_ + 1)), stride(d_ + 1), m(m_), m_A(m_A_), d(d_),
-        d_orig(d_), B(m_ + 1), Row(m_ + 1), C(d_ + 1), Col(d_ + 1) {}
+  std::vector<T> A;
+  long stride = 0;  // = nvars + 1, fixed for the Problem
+  long m = 0, d = 0;
+  T det;
+  // magnitude hint for the fixed-width pivot kernels (see arith.hpp).
+  // Reset to kUnknownBound after any direct write to A.
+  std::uint64_t bound = kUnknownBound;
+  bool lexmin = true;   // the basis is lexicographically minimal
+  std::vector<long> B, Row, C, Col;
+  long cache_r = 0, cache_s = 0;  // the pivot that left this dictionary
+  Dict *prev = this, *next = this;  // cache ring
+
+  Dict(long m_, long nvars)
+      : A((m_ + 1) * (nvars + 1)), stride(nvars + 1), m(m_), d(nvars),
+        B(m_ + 1), Row(m_ + 1), C(nvars + 1), Col(nvars + 1) {}
 
   T &a(long r, long c) { return A[r * stride + c]; }
   const T &a(long r, long c) const { return A[r * stride + c]; }
-  T *row(long r) { return &A[r * stride]; }
 };
 
 template <class Ar> struct Problem {
   using T = typename Ar::T;
   using D = Dict<Ar>;
-  static constexpr long MAXD_DEPTH = 9223372036854775807L;  // upstream MAXD
+  static constexpr unsigned long kCacheSize = 50;  // upstream dict_limit
 
   Ar *ar = nullptr;
+  long m = 0;       // constraint rows
+  long n = 0;       // columns of the input: right-hand side + nvars
+  long nvars = 0;   // = n - 1 = upstream lastdv
+  std::vector<long> linearity;  // rows that are equations, sorted
+  // slack_row[k]: input row of the k-th slack after first_basis relabels the
+  // slacks (upstream inequality). Only kept up to date by first_basis.
+  std::vector<long> slack_row;
+  long pivots = 0;
 
-  std::vector<T> Gcd, Lcm;
-  std::vector<long> redundcol, inequality, linearity, minratio, temparray;
-  long m = 0, n = 0, lastdv = 0;
-  long count[10] = {0};
-  long nredundcol = 0, nlinearity = 0;
-
-  // dictionary cache (was Qhead/Qtail + file globals dict_count/dict_limit)
+  // ---------------------------------------------------- dictionary storage
+  // Cache ring (upstream Qhead/Qtail and the global dict_count): the
+  // dictionaries of the last pivots, for backtracking without a reverse
+  // pivot. Qtail is the current dictionary.
   D *Qhead = nullptr, *Qtail = nullptr;
-  unsigned long dict_count = 0, dict_limit = 50;
-
-  // storage
+  unsigned long dict_count = 0;
   std::vector<std::unique_ptr<D>> pool;
   std::vector<D *> free_list;
+  std::size_t dicts_allocated = 0;  // cumulative, never reset (for tests)
+  std::vector<long> ratio_buf;   // upstream minratio
+  std::vector<char> mark;
 
-  // ---------------------------------------------------------------- memory
-  D *new_lrs_dic() {
+  D *new_dict() {
+    D *p;
     if (!free_list.empty()) {
-      D *p = free_list.back();
+      p = free_list.back();
       free_list.pop_back();
-      p->d = p->d_orig = n - 1;
-      p->prev = p->next = p;
-      return p;
+      p->d = nvars;
+    } else {
+      pool.emplace_back(new D(m, nvars));
+      ++dicts_allocated;
+      p = pool.back().get();
     }
-    pool.emplace_back(new D(m, n - 1, m));
-    return pool.back().get();
+    p->prev = p->next = p;
+    return p;
   }
 
-  // upstream lrs_free_dic: returns every dictionary of P's cache ring to the
-  // pool (upstream stops at Qhead and can leak part of the ring).
-  void free_ring(D *P) {
+  // Returns every dictionary of P's ring to the pool (upstream lrs_free_dic
+  // stops at Qhead and can leak part of the ring).
+  void release_ring(D *P) {
     if (!P) return;
     D *p = P;
     do {
@@ -103,99 +166,74 @@ template <class Ar> struct Problem {
     Qhead = Qtail = nullptr;
   }
 
-  // upstream lrs_alloc_dat + the problem-data part of lrs_alloc_dic.
+  // upstream lrs_alloc_dat + the problem part of lrs_alloc_dic
   void init(Ar *a, long m_, long n_) {
     ar = a;
     m = m_;
     n = n_;
-    nlinearity = 0;
-    nredundcol = 0;
-    for (long &c : count) c = 0;
-    count[2] = 1;
-    long d = n - 1;
-    linearity.assign(m + d + 1, 0);
-    inequality.assign(m + d + 1, 0);
-    redundcol.assign(m + d + 1, 0);
-    minratio.assign(m + d + 1, 0);
-    temparray.assign(m + d + 1, 0);
-    Gcd.resize(m + 1);
-    Lcm.resize(m + 1);
-    lastdv = d;
-    // drop all dictionaries from previous solves of a different shape
-    if (!pool.empty() && (pool[0]->m != m || pool[0]->d_orig != n - 1 ||
-                          pool[0]->stride != n)) {
-      pool.clear();
-      free_list.clear();
-    } else {
-      free_list.clear();
-      for (auto &p : pool) free_list.push_back(p.get());
-    }
+    nvars = n - 1;
+    pivots = 0;
+    linearity.clear();
+    linearity.reserve(m + 1);
+    slack_row.assign(m + nvars + 1, 0);
+    ratio_buf.assign(m + 1, 0);
+    // Keep the pool across solves of the same shape. (The shape is m and
+    // stride; d varies within a solve and is reset by new_dict.)
+    if (!pool.empty() && (pool[0]->m != m || pool[0]->stride != n)) pool.clear();
+    free_list.clear();
+    for (auto &p : pool) free_list.push_back(p.get());
     Qhead = Qtail = nullptr;
   }
 
-  // upstream lrs_alloc_dic (dictionary part). Creates a dictionary and makes
-  // it the cache ring.
-  D *lrs_alloc_dic() {
-    D *p = new_lrs_dic();
-    p->next = p->prev = p;
-    Qhead = Qtail = p;
-    dict_count = 1;
-    dict_limit = 50;
-    long d = n - 1;
-    p->d = p->d_orig = d;
-    p->m = m;
-    p->m_A = m;
-    p->depth = 0;
-    p->lexflag = 1;
+  // upstream lrs_alloc_dic: a zero dictionary with every slack basic, which
+  // becomes the cache ring.
+  D *initial_dict() {
+    D *p = new_ring();
     ar->set(p->det, 1);
-    p->bound = ~(std::uint64_t)0;
+    p->lexmin = true;
+    p->bound = D::kUnknownBound;
     for (long i = 0; i <= m; i++)
-      for (long j = 0; j <= d; j++) ar->set(p->a(i, j), 0);
+      for (long j = 0; j <= nvars; j++) ar->set(p->a(i, j), 0);
     for (long i = 0; i <= m; i++) {
-      p->B[i] = (i == 0) ? 0 : d + i;
+      p->B[i] = (i == 0) ? 0 : nvars + i;
       p->Row[i] = i;
     }
-    for (long j = 0; j < d; j++) {
+    for (long j = 0; j < nvars; j++) {
       p->C[j] = j + 1;
       p->Col[j] = j + 1;
     }
-    p->C[d] = m + d + 1;
-    p->Col[d] = 0;
+    p->C[nvars] = m + nvars + 1;  // sentinel
+    p->Col[nvars] = 0;
     return p;
   }
 
-  // upstream lrs_getdic: fresh dictionary that becomes the cache ring.
+  // upstream lrs_getdic: a fresh dictionary that becomes the cache ring.
   // Upstream never resets the (global, shared with player 1) dict_count
   // here, which silently disables caching for player 2 once 50 dictionaries
-  // exist. We give every enumeration its own budget; this only changes how
-  // backtracking is done (restore vs. reverse pivot), not the result.
-  D *lrs_getdic() {
-    D *p = new_lrs_dic();
-    p->next = p->prev = p;
+  // exist. Every ring gets its own budget here; this only changes how
+  // backtracking is done (restore instead of reverse pivot), not the result.
+  D *new_ring() {
+    D *p = new_dict();
     Qhead = Qtail = p;
     dict_count = 1;
     return p;
   }
 
-  void copy_dict(D *dest, D *src) {
+  void copy_dict(D *dest, const D *src) {
     assert(dest != src);
-    long m_ = src->m, m_A = src->m_A, d = src->d;
+    const long m_ = src->m, d = src->d;
     if constexpr (std::is_trivially_copyable_v<T>) {
       // one contiguous block; every dictionary of a Problem has the same stride
-      std::memcpy(dest->A.data(), src->A.data(),
-                  sizeof(T) * (m_A + 1) * src->stride);
+      std::memcpy(dest->A.data(), src->A.data(), sizeof(T) * (m_ + 1) * src->stride);
     } else {
-      for (long r = 0; r <= m_A; r++)
+      for (long r = 0; r <= m_; r++)
         for (long s = 0; s <= d; s++) ar->copy(dest->a(r, s), src->a(r, s));
     }
-    dest->i = src->i;
-    dest->j = src->j;
+    dest->cache_r = src->cache_r;
+    dest->cache_s = src->cache_s;
     dest->m = m_;
     dest->d = d;
-    dest->d_orig = src->d_orig;
-    dest->m_A = src->m_A;
-    dest->depth = src->depth;
-    dest->lexflag = src->lexflag;
+    dest->lexmin = src->lexmin;
     dest->bound = src->bound;
     ar->copy(dest->det, src->det);
     std::memcpy(dest->B.data(), src->B.data(), sizeof(long) * (m_ + 1));
@@ -204,10 +242,12 @@ template <class Ar> struct Problem {
     std::memcpy(dest->Col.data(), src->Col.data(), sizeof(long) * (d + 1));
   }
 
-  void pushQ() {
+  // upstream pushQ: advance Qtail, growing the ring up to kCacheSize and
+  // then overwriting the oldest entry.
+  void cache_push() {
     if (Qtail->next == Qhead) {
-      if (dict_count < dict_limit) {
-        D *p = new_lrs_dic();
+      if (dict_count < kCacheSize) {
+        D *p = new_dict();
         p->next = Qtail->next;
         Qtail->next->prev = p;
         Qtail->next = p;
@@ -223,548 +263,387 @@ template <class Ar> struct Problem {
     }
   }
 
-  void cache_dict(D *&Dp, long i, long j) {
-    if (dict_limit > 1) {
-      Dp->i = i;
-      Dp->j = j;
-      pushQ();
-      if (Qtail == Dp) return;
-      copy_dict(Qtail, Dp);
-    }
+  // Save Dp (and the pivot r, s about to be done on it) and continue on a
+  // copy.
+  void cache_dict(D *&Dp, long r, long s) {
+    Dp->cache_r = r;
+    Dp->cache_s = s;
+    cache_push();
+    if (Qtail == Dp) return;
+    copy_dict(Qtail, Dp);
     Dp = Qtail;
   }
 
-  bool check_cache(D *&Dp, long *i_p, long *j_p) {
+  // Backtrack by restoring the previous dictionary, if it is cached.
+  bool restore_cached(D *&Dp, long &r, long &s) {
     if (Qtail == Qhead) return false;
     Qtail = Qtail->prev;
     Dp = Qtail;
-    *i_p = Qtail->i;
-    *j_p = Qtail->j;
+    r = Qtail->cache_r;
+    s = Qtail->cache_s;
     return true;
   }
 
-  // upstream resize(): all dictionaries are full size, so only the cache
-  // ring is reset to P (as upstream does after copying).
-  D *resize(D *P) {
-    if (Qhead != P || Qtail != P || P->next != P) {
-      // return the other ring members to the pool
-      D *p = P->next;
-      while (p != P) {
-        D *nx = p->next;
-        free_list.push_back(p);
-        p = nx;
-      }
+  // upstream resize(): every dictionary is full size, so only the cache ring
+  // is reset to P.
+  D *reset_ring(D *P) {
+    for (D *p = P->next; p != P;) {
+      D *nx = p->next;
+      free_list.push_back(p);
+      p = nx;
     }
-    P->d_orig = P->d;
     Qhead = Qtail = P;
     P->next = P->prev = P;
     return P;
   }
 
-  // ------------------------------------------------------- input rows
-  // upstream lrs_set_row_mp specialised to integer input (all den == 1)
-  void set_row(D *P, long row, const long *num, bool eq) {
-    P->bound = ~(std::uint64_t)0;
-    long d = P->d;
-    long i = row;
-    T &G = Gcd[i], &L = Lcm[i];
-    T temp, mpone;
-    ar->set(mpone, 1);
-    ar->set(L, 1);
-    ar->set(G, 0);
-    for (long j = 0; j <= d; j++) {
-      ar->set(P->a(i, j), num[j]);
-      ar->copy(temp, P->a(i, j));
-      ar->gcd(G, temp);
+  // ------------------------------------------------------------ input rows
+  // upstream lrs_set_row_mp for integer rows whose gcd is at most 1, which
+  // upstream stores as given (it divides a row only by a gcd > 1; every
+  // lrsnash row has an entry +-1): A[row][j] = num(j). eq: the row is an
+  // equation.
+  template <class Num> void set_row(D *P, long row, Num num, bool eq) {
+#ifndef NDEBUG
+    long g = 0;
+    for (long j = 0; j <= nvars; j++) g = std::gcd(g, num(j));
+    assert(g <= 1 && "set_row: upstream would divide this row by its gcd");
+#endif
+    P->bound = D::kUnknownBound;
+    for (long j = 0; j <= nvars; j++) ar->set(P->a(row, j), num(j));
+    if (eq) linearity.push_back(row);
+  }
+
+  // ------------------------------------------------------- basic steps
+  // upstream reorder1: a[pos] has changed; move it to its sorted place in
+  // a[0..len-1], moving b[] along with it.
+  static void resort(long a[], long b[], long pos, long len) {
+    while (pos > 0 && a[pos] < a[pos - 1]) {
+      std::swap(a[pos], a[pos - 1]);
+      std::swap(b[pos], b[pos - 1]);
+      --pos;
     }
-    ar->storesign(G, 1);
-    ar->storesign(L, 1);
-    if (ar->greater(G, mpone) || ar->greater(L, mpone)) {
-      T one_;
-      ar->set(one_, 1);
-      for (long j = 0; j <= d; j++) {
-        ar->exactdiv(temp, P->a(i, j), G);
-        ar->mul(temp, L, temp);
-        ar->exactdiv(P->a(i, j), temp, one_);
-      }
-    }
-    if (eq) {
-      linearity[nlinearity] = row;
-      nlinearity++;
+    while (pos < len - 1 && a[pos] > a[pos + 1]) {
+      std::swap(a[pos], a[pos + 1]);
+      std::swap(b[pos], b[pos + 1]);
+      ++pos;
     }
   }
 
-  // --------------------------------------------------- core lrs routines
-  static void reorder(long a[], long range) {
-    long i, temp;
-    for (i = 0; i < range - 1; i++)
-      if (a[i] > a[i + 1]) {
-        temp = a[i];
-        a[i] = a[i + 1];
-        a[i + 1] = temp;
-      }
-    for (i = range - 2; i >= 0; i--)
-      if (a[i] > a[i + 1]) {
-        temp = a[i];
-        a[i] = a[i + 1];
-        a[i + 1] = temp;
-      }
-  }
-
-  static void reorder1(long a[], long b[], long newone, long range) {
-    long temp;
-    while (newone > 0 && a[newone] < a[newone - 1]) {
-      temp = a[newone];
-      a[newone] = a[newone - 1];
-      a[newone - 1] = temp;
-      temp = b[newone];
-      b[newone] = b[newone - 1];
-      b[--newone] = temp;
-    }
-    while (newone < range - 1 && a[newone] > a[newone + 1]) {
-      temp = a[newone];
-      a[newone] = a[newone + 1];
-      a[newone + 1] = temp;
-      temp = b[newone];
-      b[newone] = b[newone + 1];
-      b[++newone] = temp;
-    }
-  }
-
-  // upstream pivot(): the integer pivot itself is the arithmetic policy's
-  // dense kernel (Ar::pivot), which gives exactly the upstream result.
-  void pivot(D *P, long bas, long cob) {
-    count[3]++;
-    ar->pivot(P->A.data(), P->stride, P->m_A + 1, P->d + 1, P->Row[bas],
-              P->Col[cob], P->det, P->bound);
-  }
-
-  void update(D *P, long *i, long *j) {
+  // upstream pivot() + update(): exchange basic B[r] with cobasic C[s]. The
+  // integer pivot is the arithmetic policy's kernel (exactly upstream's
+  // result). On return r and s are the new positions of the entering and
+  // leaving variables in B and C.
+  void pivot(D *P, long &r, long &s) {
+    ++pivots;
+    ar->pivot(P->A.data(), P->stride, P->m + 1, P->d + 1, P->Row[r], P->Col[s], P->det,
+              P->bound);
     long *B = P->B.data(), *C = P->C.data();
-    long m_ = P->m, d = P->d;
-    long leave = B[*i], enter = C[*j];
-    B[*i] = enter;
-    reorder1(B, P->Row.data(), *i, m_ + 1);
-    C[*j] = leave;
-    reorder1(C, P->Col.data(), *j, d);
-    for (*i = 1; B[*i] != enter; (*i)++)
-      ;
-    for (*j = 0; C[*j] != leave; (*j)++)
-      ;
+    const long leave = B[r], enter = C[s];
+    B[r] = enter;
+    resort(B, P->Row.data(), r, P->m + 1);
+    C[s] = leave;
+    resort(C, P->Col.data(), s, P->d);
+    for (r = 1; B[r] != enter; r++) {
+    }
+    for (s = 0; C[s] != leave; s++) {
+    }
   }
 
-  long lrs_ratio(D *P, long col) {
-    long i, j, comp, ratiocol, basicindex, start, nstart, cindex, bindex;
-    long firstime;
-    long degencount, ndegencount;
-    long *B = P->B.data(), *Row = P->Row.data(), *Col = P->Col.data();
-    long *mr = minratio.data();
-    long m_ = P->m, d = P->d;
-    nstart = 0;
-    ndegencount = 0;
-    degencount = 0;
-    mr[P->m] = 1;
-    for (j = lastdv + 1; j <= m_; j++) {
-      if (ar->negative(P->a(Row[j], col))) {
-        mr[degencount++] = j;
-        if (ar->zero(P->a(Row[j], 0))) mr[P->m] = 0;
-      }
-    }
-    if (degencount == 0) return degencount;
-    T *Nmin = nullptr, *Dmin = nullptr;  // point into A: values are copied
-    T NminV, DminV;                      // upstream copies them
-    ratiocol = 0;
-    start = 0;
-    bindex = d + 1;
-    cindex = 0;
-    basicindex = d;
-    while (degencount > 1) {
+  // upstream lrs_ratio: the lexicographic minimum ratio test for entering
+  // column col. Returns the basis position of the leaving variable, or 0 if
+  // the column is unbounded.
+  long ratio_test(const D *P, long col) {
+    const long *B = P->B.data(), *Row = P->Row.data(), *Col = P->Col.data();
+    long *cand = ratio_buf.data();  // candidate basis positions
+    const long d = P->d;
+    long ncand = 0;
+    for (long j = nvars + 1; j <= P->m; j++)
+      if (ar->negative(P->a(Row[j], col))) cand[ncand++] = j;
+    if (ncand == 0) return 0;
+    // Break ties column by column: first the right-hand side, then the
+    // cobasic columns in index order, skipping columns of basic variables.
+    // Nmin/Dmin point into A, which is not changed here; each pass sets them
+    // at its first candidate before reading them.
+    const T *Nmin = nullptr, *Dmin = nullptr;
+    long ratiocol = 0, start = 0, nstart = 0, nnext = 0;
+    long bindex = d + 1, cindex = 0, basicindex = d;
+    while (ncand > 1) {
       if (B[bindex] == basicindex) {
-        if (mr[start] == bindex) {
+        if (cand[start] == bindex) {
           start++;
-          degencount--;
+          ncand--;
         }
         bindex++;
       } else {
-        firstime = 1;
         if (basicindex != d) ratiocol = Col[cindex++];
-        for (j = start; j < start + degencount; j++) {
-          i = Row[mr[j]];
-          comp = 1;
-          if (firstime)
-            firstime = 0;
-          else {
+        for (long j = start; j < start + ncand; j++) {
+          const long i = Row[cand[j]];
+          long comp = 1;
+          if (j != start) {
             const T &Air = P->a(i, ratiocol);
             if (ar->positive(*Nmin) || ar->negative(Air)) {
               if (ar->negative(*Nmin) || ar->positive(Air))
                 comp = ar->comprod(*Nmin, P->a(i, col), Air, *Dmin);
               else
                 comp = -1;
-            } else if (ar->zero(*Nmin) && ar->zero(Air))
+            } else if (ar->zero(*Nmin) && ar->zero(Air)) {
               comp = 0;
+            }
             if (ratiocol == 0) comp = -comp;
           }
           if (comp == 1) {
             nstart = j;
-            ar->copy(NminV, P->a(i, ratiocol));
-            ar->copy(DminV, P->a(i, col));
-            Nmin = &NminV;
-            Dmin = &DminV;
-            ndegencount = 1;
-          } else if (comp == 0)
-            mr[nstart + ndegencount++] = mr[j];
+            Nmin = &P->a(i, ratiocol);
+            Dmin = &P->a(i, col);
+            nnext = 1;
+          } else if (comp == 0) {
+            cand[nstart + nnext++] = cand[j];
+          }
         }
-        degencount = ndegencount;
+        ncand = nnext;
         start = nstart;
       }
       basicindex++;
     }
-    return mr[start];
+    return cand[start];
   }
 
-  bool ismin(D *P, long r, long s) {
-    long m_A = P->m_A;
-    for (long i = 1; i <= m_A; i++)
-      if ((i != r) && ar->negative(P->a(i, s)) &&
-          ar->comprod(P->a(i, 0), P->a(r, s), P->a(i, s), P->a(r, 0)))
-        return false;
-    return true;
-  }
-
-  bool lexmin(D *P, long col) {
-    long r, s, i, j;
-    long *B = P->B.data(), *C = P->C.data(), *Row = P->Row.data(),
-         *Col = P->Col.data();
-    long m_ = P->m, d = P->d;
-    for (i = lastdv + 1; i <= m_; i++) {
-      r = Row[i];
-      if (ar->zero(P->a(r, col)))
-        for (j = 0; j < d; j++) {
-          s = Col[j];
-          if (B[i] > C[j]) {
-            if (ar->zero(P->a(r, 0))) {
-              if (!ar->zero(P->a(r, s))) return false;
-            } else if (ar->negative(P->a(r, s)) && ismin(P, r, s)) {
-              return false;
-            }
-          }
-        }
+  // upstream lexmin(P, 0): is the basis lexicographically minimal for the
+  // current vertex? (No degenerate row may allow a smaller index in.)
+  bool lexmin(const D *P) const {
+    const long *B = P->B.data(), *C = P->C.data(), *Row = P->Row.data(),
+               *Col = P->Col.data();
+    for (long i = nvars + 1; i <= P->m; i++) {
+      const long r = Row[i];
+      if (!ar->zero(P->a(r, 0))) continue;
+      for (long j = 0; j < P->d; j++)
+        if (B[i] > C[j] && !ar->zero(P->a(r, Col[j]))) return false;
     }
     return true;
   }
 
-  bool reverse(D *P, long *r, long s) {
-    long i, j, row, col;
-    long *B = P->B.data(), *C = P->C.data(), *Row = P->Row.data(),
-         *Col = P->Col.data();
-    long d = P->d;
-    col = Col[s];
-    if (!ar->negative(P->a(0, col))) {
-      minratio[P->m] = 0;
-      return false;
+  // upstream reverse(): is pivoting C[s] in (leaving B[r]) the reverse of
+  // the simplex step that leads back to this dictionary? Sets r.
+  bool is_reverse_pivot(const D *P, long &r, long s) {
+    const long *B = P->B.data(), *C = P->C.data(), *Row = P->Row.data(),
+               *Col = P->Col.data();
+    const long col = Col[s];
+    if (!ar->negative(P->a(0, col))) return false;
+    r = ratio_test(P, col);
+    if (r == 0) return false;
+    const long row = Row[r];
+    for (long i = 0; i < P->d && C[i] < B[r]; i++) {
+      if (i == s) continue;
+      const long j = Col[i];
+      const T &A0j = P->a(0, j), &Arj = P->a(row, j);
+      if (ar->positive(A0j) || ar->negative(Arj))
+        if ((!ar->negative(A0j) && !ar->positive(Arj)) ||
+            ar->comprod(A0j, P->a(row, col), P->a(0, col), Arj) == -1)
+          return false;
     }
-    *r = lrs_ratio(P, col);
-    if (*r == 0) {
-      minratio[P->m] = 0;
-      return false;
-    }
-    row = Row[*r];
-    for (i = 0; i < d && C[i] < B[*r]; i++)
-      if (i != s) {
-        j = Col[i];
-        const T &A0j = P->a(0, j), &Arj = P->a(row, j);
-        if (ar->positive(A0j) || ar->negative(Arj))
-          if ((!ar->negative(A0j) && !ar->positive(Arj)) ||
-              ar->comprod(A0j, P->a(row, col), P->a(0, col), Arj) == -1) {
-            minratio[P->m] = 0;
-            return false;
-          }
-      }
     return true;
   }
 
-  bool selectpivot(D *P, long *r, long *s) {
-    long j, col;
-    long *Col = P->Col.data();
-    long d = P->d;
-    *r = 0;
-    *s = d;
-    j = 0;
-    while ((j < d) && (!ar->positive(P->a(0, Col[j])))) j++;
+  // upstream selectpivot: Bland's rule (smallest index with a positive cost).
+  bool select_pivot(const D *P, long &r, long &s) {
+    const long *Col = P->Col.data();
+    const long d = P->d;
+    r = 0;
+    s = d;
+    long j = 0;
+    while (j < d && !ar->positive(P->a(0, Col[j]))) j++;
     if (j < d) {
-      *s = j;
-      col = Col[j];
-      *r = lrs_ratio(P, col);
-      if (*r != 0) return true;
+      s = j;
+      r = ratio_test(P, Col[j]);
+      if (r != 0) return true;
     }
     return false;
   }
 
-  bool primalfeasible(D *P) {
-    long i, j;
-    long *Row = P->Row.data(), *Col = P->Col.data();
-    long m_ = P->m, d = P->d;
+  // upstream primalfeasible: pivot until every slack's right-hand side is
+  // nonnegative. False if some row cannot be repaired (infeasible).
+  bool make_primal_feasible(D *P) {
+    const long *Row = P->Row.data(), *Col = P->Col.data();
     for (;;) {
-      i = lastdv + 1;
-      while (i <= m_ && !ar->negative(P->a(Row[i], 0))) i++;
-      if (i <= m_) {
-        j = 0;
-        while (j < d && !ar->positive(P->a(Row[i], Col[j]))) j++;
-        if (j >= d) return false;
-        pivot(P, i, j);
-        update(P, &i, &j);
-      } else
-        return true;
+      long i = nvars + 1;
+      while (i <= P->m && !ar->negative(P->a(Row[i], 0))) i++;
+      if (i > P->m) return true;
+      long j = 0;
+      while (j < P->d && !ar->positive(P->a(Row[i], Col[j]))) j++;
+      if (j >= P->d) return false;
+      pivot(P, i, j);
     }
   }
 
-  bool removecobasicindex(D *P, long k) {
-    long i, j, cindex, deloc;
+  // upstream removecobasicindex: delete cobasic variable C[k] and its column
+  // (a cobasic equation slack is 0 at every vertex). Higher indices shift
+  // down by one; the last column of A moves into the freed one.
+  void remove_cobasic(D *P, long k) {
     long *B = P->B.data(), *C = P->C.data(), *Col = P->Col.data();
-    long m_ = P->m, d = P->d;
-    cindex = C[k];
-    deloc = Col[k];
-    for (i = 1; i <= m_; i++)
+    const long m_ = P->m, d = P->d;
+    const long cindex = C[k], deloc = Col[k];
+    for (long i = 1; i <= m_; i++)
       if (B[i] > cindex) B[i]--;
-    for (j = k; j < d; j++) {
+    for (long j = k; j < d; j++) {
       C[j] = C[j + 1] - 1;
       Col[j] = Col[j + 1];
     }
     if (deloc != d) {
-      for (i = 0; i <= m_; i++) ar->copy(P->a(i, deloc), P->a(i, d));
-      j = 0;
+      for (long i = 0; i <= m_; i++) ar->copy(P->a(i, deloc), P->a(i, d));
+      long j = 0;
       while (Col[j] != d) j++;
       Col[j] = deloc;
     }
     P->d--;
+  }
+
+  // ------------------------------------------------------ the first basis
+  // The order in which find_basis tries the slacks: the linearities, then
+  // the other rows from m down to 1 (upstream lrs_getfirstbasis).
+  void start_order(long *order) {
+    mark.assign(m + 1, 0);
+    long k = 0;
+    for (long r : linearity) {
+      order[k++] = r;
+      mark[r] = 1;
+    }
+    for (long i = m; i >= 1; i--)
+      if (!mark[i]) order[k++] = i;
+  }
+
+  // The first part of upstream getabasis: pivot every decision variable into
+  // the basis, slacks in the given order, and drop linearities whose row is
+  // 0 = 0. False if a linearity is inconsistent. Afterwards the remaining
+  // linearities are all cobasic: pivots only bring decision variables in.
+  bool find_basis(D *P, const long *order) {
+    const long *B = P->B.data(), *C = P->C.data(), *Row = P->Row.data(),
+               *Col = P->Col.data();
+    const long m_ = P->m, d = P->d;
+    const long nlin = (long)linearity.size();
+    for (long j = 0; j < m_; j++) {
+      long i = 0;
+      while (i <= m_ && B[i] != d + order[j]) i++;
+      if (j < nlin && i > m_) return false;
+      if (i > m_) continue;
+      long k = 0;
+      while (C[k] <= d && ar->zero(P->a(Row[i], Col[k]))) k++;
+      if (C[k] <= d) {
+        pivot(P, i, k);
+      } else if (j < nlin) {
+        if (!ar->zero(P->a(Row[i], 0))) return false;
+        linearity[j] = 0;  // redundant equation
+      }
+    }
+    long kept = 0;
+    for (long r : linearity)
+      if (r != 0) linearity[kept++] = r;
+    linearity.resize(kept);
+    // a decision variable left cobasic would be a redundant column
+    if (C[0] <= d)
+      throw std::logic_error("lrsnash: rank-deficient system (redundant column)");
     return true;
   }
 
-  bool getabasis(D *P, long order[]) {
-    long i, j, k;
-    long *B = P->B.data(), *C = P->C.data(), *Row = P->Row.data(),
-         *Col = P->Col.data();
-    long m_ = P->m, d = P->d, nlin = nlinearity;
-    long nred = 0;
-    for (j = 0; j < m_; j++) {
-      i = 0;
-      while (i <= m_ && B[i] != d + order[j]) i++;
-      if (j < nlin && i > m_) return false;
-      if (i <= m_) {
-        k = 0;
-        while (C[k] <= d && ar->zero(P->a(Row[i], Col[k]))) k++;
-        if (C[k] <= d) {
-          pivot(P, i, k);
-          update(P, &i, &k);
-        } else if (j < nlin) {
-          if (ar->zero(P->a(Row[i], 0)))
-            linearity[j] = 0;
-          else
-            return false;
+  // The tail of upstream getabasis: remove the columns of cobasic linearity
+  // slacks (they are 0 at every vertex of the face). Slack r has index
+  // nvars + r before any removal; each removal shifts the higher indices
+  // down by one and lowers d by one, and the linearities are sorted, so the
+  // slack of r is looked up as r + d with the current d (as upstream).
+  void remove_linearity_columns(D *P) {
+    for (long r : linearity) {
+      const long *C = P->C.data();
+      long k = 0;
+      while (k < P->d && C[k] != r + P->d) k++;
+      if (k < P->d) remove_cobasic(P, k);
+    }
+  }
+
+  // The rest of upstream lrs_getfirstbasis: reach a feasible basis, set the
+  // objective to minus the sum of the cobasic variables, and relabel the
+  // cobasic slacks so that they have the smallest slack indices (this makes
+  // the starting basis the root of the reverse search tree). If track is
+  // true, slack_row is set up and follows the relabelling.
+  bool finish_basis(D *&Dp, bool track) {
+    const long d = Dp->d;
+    long *ineq = slack_row.data();
+    if (track) {
+      for (long i = 1; i <= m; i++) ineq[i] = i;
+      if (!linearity.empty()) {
+        for (long r : linearity) ineq[r] = 0;
+        long k = 1;
+        for (long i = 1; i <= m - (long)linearity.size(); i++) {
+          while (k <= m && ineq[k] == 0) k++;
+          ineq[i] = ineq[k++];
         }
       }
     }
-    i = 0;
-    k = 0;
-    while (k < nlin) {
-      while (k < nlin && linearity[k] == 0) k++;
-      if (k < nlin) linearity[i++] = linearity[k++];
-    }
-    nlin = i;
-    nlinearity = i;
-    k = 0;
-    while (k < d && C[k] <= d) {
-      if (C[k] <= d) redundcol[nred++] = C[k];
-      k++;
-    }
-    nredundcol = nred;
-    lastdv = d - nred;
-    for (i = 0; i < nlin; i++) {
-      k = 0;
-      while (k < d && C[k] != linearity[i] + d) k++;
-      if (k >= d) return false;
-      if (!removecobasicindex(P, k)) return false;
-      d = P->d;
-    }
-    return true;
-  }
-
-  void getnextoutput(D *P, long i, long col, T &out) {
-    ar->copy(out, P->a(P->Row[i], col));
-  }
-
-  void reducearray(std::vector<T> &p, long n_) {
-    T divisor, Temp;
-    long i = 0;
-    while ((i < n_) && ar->zero(p[i])) i++;
-    if (i == n_) return;
-    ar->copy(divisor, p[i]);
-    ar->storesign(divisor, 1);
-    i++;
-    while (i < n_) {
-      if (!ar->zero(p[i])) {
-        ar->copy(Temp, p[i]);
-        ar->storesign(Temp, 1);
-        ar->gcd(divisor, Temp);
-      }
-      i++;
-    }
-    for (i = 0; i < n_; i++)
-      if (!ar->zero(p[i])) {
-        ar->copy(Temp, p[i]);
-        ar->exactdiv(p[i], Temp, divisor);
-      }
-  }
-
-  bool lrs_getvertex(D *P, std::vector<T> &output, bool reduce = true) {
-    long i, ind, ired;
-    long lexflag = P->lexflag;
-    if (lexflag) {
-      ++count[1];
-      if (P->depth > count[8]) count[8] = P->depth;
-    }
-    if (!lexflag) return false;
-    i = 1;
-    ired = 0;
-    ar->copy(output[0], P->det);
-    for (ind = 1; ind < n; ind++)
-      if ((ired < nredundcol) && (redundcol[ired] == ind)) {
-        ar->set(output[ind], 0);
-        ired++;
-      } else {
-        getnextoutput(P, i, 0, output[ind]);
-        i++;
-      }
-    if (reduce) reducearray(output, n);
-    if (lexflag && ar->one(output[0])) ++count[4];
-    return true;
-  }
-
-  bool lrs_getray(D *P, long col, long redcol, std::vector<T> &output) {
-    long i, ind, ired;
-    if (redcol == n) ++count[0];
-    i = 1;
-    ired = 0;
-    for (ind = 0; ind < n; ind++) {
-      if (ind == 0)
-        ar->set(output[0], 0);
-      else if ((ired < nredundcol) && (redundcol[ired] == ind)) {
-        if (redcol == ind)
-          ar->copy(output[ind], P->det);
-        else
-          ar->set(output[ind], 0);
-        ired++;
-      } else {
-        getnextoutput(P, i, col, output[ind]);
-        i++;
-      }
-    }
-    reducearray(output, n);
-    return true;
-  }
-
-  bool lrs_getsolution(D *P, std::vector<T> &output, long col,
-                       bool reduce = true) {
-    long j;
-    long *Row = P->Row.data();
-    if (col == 0) return lrs_getvertex(P, output, reduce);
-    if (!ar->negative(P->a(0, col))) return false;
-    j = lastdv + 1;
-    while (j <= P->m && !ar->negative(P->a(Row[j], col))) j++;
-    if (j <= P->m) return false;
-    if (lexmin(P, col)) {
-      if (P->depth > count[8]) count[8] = P->depth;
-      return lrs_getray(P, col, n, output);
-    }
-    return false;
-  }
-
-  // upstream lrs_getfirstbasis (Lin is not needed by nash and is dropped)
-  bool lrs_getfirstbasis(D *&Dp) {
-    long i, j, k;
-    long m_ = Dp->m, d = Dp->d;
-    long nlin = nlinearity;
-    long *ineq = inequality.data();
-    for (i = 0; i < nlin; i++) ineq[i] = linearity[i];
-    k = nlin;
-    for (i = m_; i >= 1; i--) {
-      j = 0;
-      while (j < k && ineq[j] != i) j++;
-      if (j == k) ineq[k++] = i;
-    }
-    for (j = 0; j <= d; j++) ar->set(Dp->a(0, j), 0);
-    if (!getabasis(Dp, ineq)) return false;
-    nlin = nlinearity;
-    long nred = nredundcol, ldv = lastdv;
-    d = Dp->d;
-    for (i = 1; i <= m_; i++) ineq[i] = i;
-    if (nlin > 0) {
-      for (i = 0; i < nlin; i++) ineq[linearity[i]] = 0;
-      k = 1;
-      for (i = 1; i <= m_ - nlin; i++) {
-        while (k <= m_ && ineq[k] == 0) k++;
-        ineq[i] = ineq[k++];
-      }
-    }
-    if (nred > 0) {
-      std::vector<T> lin(n);
-      for (i = 0; i < nred; i++) {
-        lrs_getray(Dp, Dp->Col[0], Dp->C[0] + i, lin);
-        if (!removecobasicindex(Dp, 0)) return false;
-      }
-    }
-    if (!primalfeasible(Dp)) return false;
-    for (j = 1; j <= d; j++) {
+    if (!make_primal_feasible(Dp)) return false;
+    for (long j = 1; j <= d; j++) {
       ar->copy(Dp->a(0, j), Dp->det);
       ar->storesign(Dp->a(0, j), -1);
     }
     ar->set(Dp->a(0, 0), 0);
-    Dp->bound = ~(std::uint64_t)0;
+    Dp->bound = D::kUnknownBound;
     long *B = Dp->B.data(), *C = Dp->C.data();
-    while (C[0] <= m_) {
-      i = C[0];
-      j = ineq[B[i] - ldv];
-      ineq[B[i] - ldv] = ineq[C[0] - ldv];
-      ineq[C[0] - ldv] = j;
+    while (C[0] <= m) {
+      const long i = C[0];
+      if (track) std::swap(ineq[B[i] - nvars], ineq[C[0] - nvars]);
       C[0] = B[i];
       B[i] = i;
-      reorder1(C, Dp->Col.data(), 0, d);
+      resort(C, Dp->Col.data(), 0, d);
     }
-    if (n - 1 > Dp->d) Dp = resize(Dp);
+    if (nvars > Dp->d) Dp = reset_ring(Dp);
     return true;
   }
 
-  bool lrs_getnextbasis(D *&Dp) {
+  // upstream lrs_getfirstbasis: from the initial dictionary to the root of
+  // the reverse search. False if the system is infeasible.
+  bool first_basis(D *&Dp) {
+    start_order(slack_row.data());
+    for (long j = 0; j <= Dp->d; j++) ar->set(Dp->a(0, j), 0);
+    if (!find_basis(Dp, slack_row.data())) return false;
+    remove_linearity_columns(Dp);
+    return finish_basis(Dp, true);
+  }
+
+  // ------------------------------------------------------- reverse search
+  // upstream lrs_getnextbasis: the next dictionary in reverse search order.
+  // Backtracks by restoring a cached dictionary or, if it has been evicted,
+  // by the forward simplex pivot.
+  bool next_basis(D *&Dp) {
     long i = 0, j = 0;
-    long m_ = Dp->m, d = Dp->d;
+    const long m_ = Dp->m, d = Dp->d;
     bool backtrack = false;
-    while ((j < d) || (Dp->B[m_] != m_)) {
-      if (Dp->depth >= MAXD_DEPTH) backtrack = true;
+    while (j < d || Dp->B[m_] != m_) {
       if (backtrack) {
         backtrack = false;
-        if (!check_cache(Dp, &i, &j)) {
-          Dp->depth--;
-          selectpivot(Dp, &i, &j);
+        if (!restore_cached(Dp, i, j)) {
+          select_pivot(Dp, i, j);
           pivot(Dp, i, j);
-          update(Dp, &i, &j);
         }
         j++;
       }
-      if (Dp->depth < -MAXD_DEPTH) break;
-      while ((j < d) && (!reverse(Dp, &i, j))) j++;
-      if (j == d)
+      while (j < d && !is_reverse_pivot(Dp, i, j)) j++;
+      if (j == d) {
         backtrack = true;
-      else {
+      } else {
         cache_dict(Dp, i, j);
-        Dp->depth++;
         pivot(Dp, i, j);
-        update(Dp, &i, &j);
-        Dp->lexflag = lexmin(Dp, 0);
-        count[2]++;
+        Dp->lexmin = lexmin(Dp);
         return true;
       }
     }
     return false;
+  }
+
+  // upstream lrs_getvertex without the gcd reduction: if the basis is
+  // lexicographically minimal (each vertex is reported once), out[0] = det
+  // and out[k] = numerator of x_k, k = 1..nvars.
+  bool get_vertex(const D *P, std::vector<T> &out) const {
+    if (!P->lexmin) return false;
+    ar->copy(out[0], P->det);
+    for (long k = 1; k <= nvars; k++) ar->copy(out[k], P->a(P->Row[k], 0));
+    return true;
   }
 };
 
