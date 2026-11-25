@@ -333,9 +333,6 @@ of this list were done in the second round (section 10). Still open:
     halve it.
   - It can return a different optimal pair than today's `Mode::Any` in
     degenerate games, which is allowed but is a behaviour change.
-- **A thin `I64::pivot` dispatcher**, so that GCC can inline the plain
-  kernel into its callers. This targets the small-game residual of the
-  default build (section 10.6): a few ns per game below 8 columns.
 - **Padding LP/LH rows to a multiple of 4** so that the AVX2 loop needs no
   scalar epilogue. By instruction count this is about even at 9x9 (3 vector
   iterations against 2 plus 2 scalar entries), so it waits for timing.
@@ -359,35 +356,31 @@ after a first set of native measurements the evidence was callgrind
 instruction counts. These are deterministic and do not depend on machine
 load, and they are backed by reading the generated code.
 
-The final state, after the fix in section 10.6, was then timed natively:
-`-O3 -DNDEBUG`, pinned to one core, best of 5, the three builds
-alternating. The "plain kernel" build has `-DLRSNASH_NO_AVX2`. Times are in
-µs per game; the percentages are against `18834e9`:
+The final state, after the fixes in section 10.6, was then timed natively:
+`-O3 -DNDEBUG`, pinned to one core, best of 5, the builds alternating. The
+"plain kernel" build has `-DLRSNASH_NO_AVX2`. Times are in µs per game; the
+percentages are against `18834e9`:
 
 | case | before | plain kernel | AVX2 (default) |
 |---|---|---|---|
-| 2x2 LH int64 | 0.133 | **+2.4%** | **+6.3%** |
-| 4x4 / 6x6 LP int64 | 0.307 / 0.754 | **+2.4% / +1.2%** | **+4.8% / +1.9%** |
-| 9x9 LP int64 | 1.90 | **+4.5%** | -8.5% |
-| 9x9 LP auto | 1.95 | **+2.8%** | -9.3% |
-| 15x15 LP auto | 11.77 | -6.1% | -13.8% |
-| 15x15 LP int128 | 16.46 | -13.0% | -12.4% |
-| 4x4 / 9x9 LH int64 | 0.458 / 2.93 | -7.0% / -22.3% | -2.6% / -29.7% |
-| 15x15 LH auto | 11.64 | -30.8% | -44.5% |
-| 15x15 LH int128 | 25.45 | -42.7% | -42.6% |
-| 9x9 Last int64 | 591.1 | -11.6% | -25.5% |
-| 9x9 Last int128 | 1,162 | -17.3% | -17.5% |
-| 9x9 First int64 | 138.1 | -11.8% | -25.6% |
-| 12x12 Last int128 | 19,394 | -17.7% | -17.5% |
+| 4x4 / 6x6 LP int64 | 0.310 / 0.763 | -2.4% / -4.2% | +0.4% / -6.2% |
+| 7x7 LP int64 | 1.05 | -0.5% | -6.8% |
+| 9x9 LP int64 | 1.96 | -1.4% | -10.0% |
+| 9x9 LP auto | 1.99 | +0.3% | -9.9% |
+| 15x15 LP auto | 12.02 | -7.7% | -14.6% |
+| 15x15 LP int128 | 16.86 | -13.3% | -12.5% |
+| 2x2 / 4x4 LH int64 | 0.138 / 0.471 | +1.2% / -7.3% | +1.8% / -5.9% |
+| 6x6 / 9x9 LH int64 | 1.14 / 2.97 | -16.5% / -24.5% | -15.2% / -29.3% |
+| 15x15 LH auto | 12.11 | -31.1% | -44.7% |
+| 15x15 LH int128 | 26.41 | -42.7% | -42.6% |
+| 6x6 / 9x9 Last int64 | 42.3 / 608.4 | -8.9% / -11.6% | -17.3% / -24.6% |
+| 9x9 Last int128 | 1,199 | -17.5% | -17.5% |
+| 9x9 First int64 | 141.2 | -11.6% | -24.9% |
+| 12x12 Last int128 | 19,984 | -18.8% | -18.5% |
 
-**Remaining partial regression.**
-- Dictionaries with fewer than 8 columns take the plain kernel on every
-  machine. There the final state is 1-6% slower than `18834e9`, which is
-  8-15 ns per game at 2x2 and 4x4.
-- Where only the plain kernel runs (`-DLRSNASH_NO_AVX2`, or a CPU without
-  AVX2), the 9x9 LP is 4.5% slower.
-- Section 10.6 traces most of this to code placement, not to the kernel's
-  code.
+Run-to-run noise is about 1-2%, so nothing is measurably slower than
+`18834e9` any more. The commit before this fix, `b37a781`, was still 4-5%
+slower on 2x2 and 4x4 games (section 10.6).
 
 Section 10.4 predicted that AVX2's real gain would exceed its
 instruction-count reduction, because callgrind counts each vector
@@ -561,7 +554,7 @@ executed 1.2% fewer instructions. On AVX2 machines, dictionaries under 8
 columns take that path too.
 
 These are a few percent of sub-microsecond solves, so the investigation
-stopped after three cheap steps (A/B interleaved, best of 5):
+first stopped after three cheap steps (A/B interleaved, best of 5):
 
 1. **Drop the int64 k = 0 specialization.** It saved one `sar` per entry,
    but it added a second copy of the row loop and an unpredictable branch
@@ -578,17 +571,42 @@ stopped after three cheap steps (A/B interleaved, best of 5):
    6x6 (0.0% and -0.1%) and shrinks to +2.3% at 9x9. Most of what remains
    is where the code lands in the binary.
 
-Step 1 is kept, since it also removes code. Step 2 is not kept. The table
-at the start of section 10 shows what remains.
+Step 1 is kept, since it also removes code. Step 2 is not kept.
 
-One lead is left for later. In the default build, step 2's variant also
-brought 4x4 and 6x6 LPs back level with `18834e9` (-0.5% and -0.1%, one
-run); the kept version was at +4.5% and +1.8% in that run.
-- In that build `pivot` had become a small dispatcher, and GCC inlined the
-  whole plain kernel into its callers.
-- A thin dispatcher in front of the kept kernel might do the same.
-- It was not tried: the gain would be a few ns per game, on games smaller
-  than the usual 9x9 (section 8).
+Step 2 left one lead. In the default build, its variant brought 4x4 and
+6x6 LPs back level with `18834e9` (-0.5% and -0.1%, one run). In that
+build `pivot` had become a small dispatcher, and GCC had inlined the whole
+plain kernel into its callers. That was committed as `b37a781` with the
+rest noted as a partial regression. The user then asked for two
+follow-ups:
+
+4. **Inline the plain kernel into its callers** (`always_inline` on
+   `I64::pivot`; the AVX2 kernel stays out of line). Three variants were
+   timed: GCC's choice, forced inline and forced out of line. Only forced
+   inline is reliable, because GCC inlined the kernel in one build and not
+   in the other. Against `b37a781`:
+   - default build: 4x4 LP +4.0% -> +0.1%, 2x2 LH +5.2% -> +1.9%;
+   - plain build: 4x4 LP +2.6% -> -2.0%, 9x9 LP +4.1% -> -1.3%;
+   - Lemke-Howson at 9x9, Last and First did not change.
+
+   Forced out of line, the kernel stayed 2-3% slower on small games. It is
+   not known whether the cost was code placement or the call and frame
+   setup around the kernel; inlining removes it either way.
+5. **Time the AVX2 cut-over.** Two builds were compared at every row
+   length: one always takes the AVX2 kernel, the other never does. AVX2 at
+   each length, against the plain kernel:
+
+   | row length (game) | LP | LH | Last |
+   |---|---|---|---|
+   | 5 (4x4) | +3.7% | +2.0% | |
+   | 6 (5x5) | -0.4% | +1.2% | -3.2% |
+   | 7 (6x6) | -4.5% | -0.9% | -7.7% |
+   | 8 (7x7) | -8.6% | -8.4% | -12.3% |
+   | 9 (8x8) | -10.7% | -9.3% | -13.0% |
+
+   The cut-over moved from 8 to 7 entries (`kAvx2MinCols`), so 6x6 games
+   now take AVX2 too. The 6x6 LP went from +2.0% to -6.2% against
+   `18834e9`.
 
 ## Reproducing
 

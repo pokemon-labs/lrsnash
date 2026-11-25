@@ -12,18 +12,14 @@
 //                                  callers may prefer arithmetic to branches
 //   set(T&, long)                  a = v                      (itomp)
 //   copy(T&, const T&)             a = b
-//   zero/positive/negative/one     predicates
+//   zero/positive/negative         predicates
 //   sign(const T&)                 -1 if a < 0 else +1  (lrs: zero is POS)
 //   storesign(T&, long s)          a = |a| * s
 //   changesign(T&)                 a = -a
 //   greater(const T&, const T&)    a > b
-//   mul(T& c, const T& a, const T& b)        c = a*b
 //   qpiv(T& a, const T& b, const T& c, const T& d, const T& e)
 //                                  a = (a*b - c*d) / e   (exact division)
 //   comprod(a, b, c, d)            sign(a*b - c*d)
-//   exactdiv(T& c, T& a, T& b)     c = a/b exactly (a may be clobbered)
-//   gcd(T& u, T& v)                u = gcd(u, v)   (v may be clobbered)
-//   lcm(T& a, const T& b)          a = lcm(a, b)
 //   to_double(const T&)
 //   pivot(T* A, stride, rows, cols, r, s, T& det, uint64_t& bound)
 //                                  the whole lrs integer pivot on a dense
@@ -159,7 +155,6 @@ struct I64 {
   static bool zero(const T &a) { return a == 0; }
   static bool positive(const T &a) { return a > 0; }
   static bool negative(const T &a) { return a < 0; }
-  static bool one(const T &a) { return a == 1; }
   static long sign(const T &a) { return a < 0 ? -1 : 1; }
   static void changesign(T &a) {
     if (a == std::numeric_limits<T>::min()) overflow("I64 changesign");
@@ -169,9 +164,6 @@ struct I64 {
     if ((s < 0) != (a < 0) && a != 0) changesign(a);
   }
   static bool greater(const T &a, const T &b) { return a > b; }
-  static void mul(T &c, const T &a, const T &b) {
-    if (__builtin_mul_overflow(a, b, &c)) overflow("I64 mul");
-  }
   static void qpiv(T &a, const T &b, const T &c, const T &d, const T &e) {
     __int128 t = (__int128)a * b - (__int128)c * d;  // cannot overflow
     t /= e;
@@ -182,28 +174,6 @@ struct I64 {
   static long comprod(const T &a, const T &b, const T &c, const T &d) {
     __int128 x = (__int128)a * b, y = (__int128)c * d;
     return x > y ? 1 : (x < y ? -1 : 0);
-  }
-  static void exactdiv(T &c, T &a, T &b) { c = a / b; }
-  static void gcd(T &u, T &v) {
-    std::uint64_t ul = u < 0 ? 0 - (std::uint64_t)u : (std::uint64_t)u;
-    std::uint64_t vl = v < 0 ? 0 - (std::uint64_t)v : (std::uint64_t)v;
-    if (ul == 0) {
-      ul = vl;
-    } else {
-      while (vl != 0) {
-        std::uint64_t r = ul % vl;
-        ul = vl;
-        vl = r;
-      }
-    }
-    if (ul > (std::uint64_t)std::numeric_limits<T>::max()) overflow("I64 gcd");
-    u = (T)ul;
-  }
-  void lcm(T &a, const T &b) {
-    T u = a, v = b, q;
-    gcd(u, v);
-    exactdiv(q, a, u);
-    mul(a, q, b);
   }
   static double to_double(const T &a) { return (double)a; }
 
@@ -242,8 +212,12 @@ struct I64 {
            (double)e * (double)(1ULL << (62 - k));
   }
   static void from_i64(T &a, std::int64_t v) { a = v; }
-  void pivot(T *A, long stride, long rows, long cols, long r, long s, T &det,
-             std::uint64_t &bound) {
+  // always_inline puts the plain kernel into each caller (the LP,
+  // Lemke-Howson and the lrs pivot). Called out of line, it was 2-6% slower
+  // on games up to 6x6, and on the 9x9 LP where it is the only kernel
+  // (timed, session 7). The AVX2 kernel stays out of line.
+  __attribute__((always_inline)) void pivot(T *A, long stride, long rows, long cols,
+                                            long r, long s, T &det, std::uint64_t &bound) {
 #ifdef LRSNASH_AVX2
     if (avx2 && cols >= kAvx2MinCols) {
       pivot_avx2(A, stride, rows, cols, r, s, det, bound);
@@ -257,9 +231,11 @@ struct I64 {
   // Use the AVX2 kernel: set if the CPU has AVX2. The results are the same
   // bit for bit either way (tests clear it to check the plain kernel).
   bool avx2 = __builtin_cpu_supports("avx2");
-  // Shorter rows get at most one vector iteration plus a scalar tail, and
-  // the plain kernel does less work there (instruction counts, session 6).
-  static constexpr long kAvx2MinCols = 8;
+  // Rows of at least this many entries take the AVX2 kernel. Timed against
+  // the plain kernel (session 7): at 7 entries AVX2 is faster in the LP
+  // (-4.5%), Lemke-Howson (-0.9%) and the enumeration (-7.7%); at 6 the
+  // result is mixed, and at 5 AVX2 is slower.
+  static constexpr long kAvx2MinCols = 7;
 #endif
 
  private:
@@ -411,7 +387,6 @@ struct I128 {
   static bool zero(const T &a) { return a == 0; }
   static bool positive(const T &a) { return a > 0; }
   static bool negative(const T &a) { return a < 0; }
-  static bool one(const T &a) { return a == 1; }
   static long sign(const T &a) { return a < 0 ? -1 : 1; }
   static void changesign(T &a) {
     if (a == MIN) overflow("I128 changesign");
@@ -421,9 +396,6 @@ struct I128 {
     if ((s < 0) != (a < 0) && a != 0) changesign(a);
   }
   static bool greater(const T &a, const T &b) { return a > b; }
-  static void mul(T &c, const T &a, const T &b) {
-    if (__builtin_mul_overflow(a, b, &c)) overflow("I128 mul");
-  }
 
   // --- exact 256-bit helpers (magnitudes, hi:lo) ---
   struct W256 {
@@ -513,27 +485,6 @@ struct I128 {
     bool neg = nz != (e < 0);
     if (q > (U)MAX) overflow("I128 qpiv");
     a = neg ? -(T)q : (T)q;
-  }
-  static void exactdiv(T &c, T &a, T &b) { c = a / b; }
-  static void gcd(T &u, T &v) {
-    U ul = uabs(u), vl = uabs(v);
-    if (ul == 0) {
-      ul = vl;
-    } else {
-      while (vl != 0) {
-        U r = ul % vl;
-        ul = vl;
-        vl = r;
-      }
-    }
-    if (ul > (U)MAX) overflow("I128 gcd");
-    u = (T)ul;
-  }
-  void lcm(T &a, const T &b) {
-    T u = a, v = b, q;
-    gcd(u, v);
-    exactdiv(q, a, u);
-    mul(a, q, b);
   }
   static double to_double(const T &a) { return (double)a; }
 
@@ -744,7 +695,6 @@ template <long W = 112> struct MP {
   static bool positive(const T &a) { return !(a[0] < 2 || (a[0] == 2 && a[1] == 0)); }
   static bool negative(const T &a) { return !(a[0] > -2 || (a[0] == -2 && a[1] == 0)); }
   static bool zero(const T &a) { return (a[0] == 2 || a[0] == -2) && a[1] == 0; }
-  static bool one(const T &a) { return a[0] == 2 && a[1] == 1; }
 
   static void copy(T &a, const T &b) {
     long lb = length(b);
@@ -829,14 +779,6 @@ template <long W = 112> struct MP {
     storelength(c, nlength);
     storesign(c, sa == sb ? 1 : -1);
     normalize(c);
-  }
-  void mul(T &c, const T &a, const T &b) {
-    if (&c == &a) {  // upstream mulint allows only b == c aliasing
-      t1 = a;
-      mulint(t1, b, c);
-    } else {
-      mulint(a, b, c);
-    }
   }
 
   // a = a*ka + b*kb
@@ -953,68 +895,6 @@ template <long W = 112> struct MP {
     }
   }
 
-  static void exactdiv(T &c, T &a, T &b) { divint(a, b, c); }
-
-  // u = gcd(u, v), v destroyed
-  void gcd(T &u, T &v) {
-    T &r = t2;
-    unsigned long long ul, vl;
-    long i;
-    constexpr unsigned long long maxspval = 9;  // MAXD / BASE^2
-    constexpr long maxsplen = 4;
-    if (greater(v, u)) goto bigv;
-  bigu:
-    if (zero(v)) return;
-    if ((i = length(u)) < maxsplen || (i == maxsplen && (unsigned long long)u[maxsplen - 1] < maxspval))
-      goto quickfinish;
-    divint(u, v, r);
-    normalize(u);
-  bigv:
-    if (zero(u)) {
-      copy(u, v);
-      return;
-    }
-    if ((i = length(v)) < maxsplen || (i == maxsplen && (unsigned long long)v[maxsplen - 1] < maxspval))
-      goto quickfinish;
-    divint(v, u, r);
-    normalize(v);
-    goto bigu;
-  quickfinish:
-    ul = vl = 0;
-    for (i = length(u) - 1; i > 0; i--) ul = BASE * ul + u[i];
-    for (i = length(v) - 1; i > 0; i--) vl = BASE * vl + v[i];
-    if (ul > vl) goto qv;
-  qu:
-    if (!vl) {
-      for (i = 1; ul; i++) {
-        u[i] = ul % BASE;
-        ul = ul / BASE;
-      }
-      storelength(u, i);
-      return;
-    }
-    ul %= vl;
-  qv:
-    if (!ul) {
-      for (i = 1; vl; i++) {
-        u[i] = vl % BASE;
-        vl = vl / BASE;
-      }
-      storelength(u, i);
-      return;
-    }
-    vl %= ul;
-    goto qu;
-  }
-
-  void lcm(T &a, const T &b) {
-    copy(t3, a);
-    copy(t4, b);
-    gcd(t3, t4);
-    exactdiv(t4, a, t3);  // t4 = a/u
-    mulint(t4, b, a);
-  }
-
   long comprod(const T &a, const T &b, const T &c, const T &d) {
     mulint(a, b, t1);
     mulint(c, d, t2);
@@ -1068,7 +948,7 @@ template <long W = 112> struct MP {
   }
 
  private:
-  T t1, t2, t3, t4;  // scratch
+  T t1, t2;  // scratch for comprod and qpiv
 };
 
 #ifdef LRSNASH_HAVE_GMP
@@ -1093,14 +973,12 @@ struct GMP {
   static bool zero(const T &a) { return mpz_sgn(a.z) == 0; }
   static bool positive(const T &a) { return mpz_sgn(a.z) > 0; }
   static bool negative(const T &a) { return mpz_sgn(a.z) < 0; }
-  static bool one(const T &a) { return mpz_cmp_si(a.z, 1) == 0; }
   static long sign(const T &a) { return mpz_sgn(a.z) < 0 ? -1 : 1; }
   static void changesign(T &a) { mpz_neg(a.z, a.z); }
   static void storesign(T &a, long s) {
     if (s * sign(a) < 0) mpz_neg(a.z, a.z);
   }
   static bool greater(const T &a, const T &b) { return mpz_cmp(a.z, b.z) > 0; }
-  static void mul(T &c, const T &a, const T &b) { mpz_mul(c.z, a.z, b.z); }
   void qpiv(T &a, const T &b, const T &c, const T &d, const T &e) {
     mpz_mul(t1.z, a.z, b.z);
     mpz_submul(t1.z, c.z, d.z);
@@ -1111,14 +989,6 @@ struct GMP {
     mpz_mul(t2.z, c.z, d.z);
     int i = mpz_cmp(t1.z, t2.z);
     return i > 0 ? 1 : (i < 0 ? -1 : 0);
-  }
-  static void exactdiv(T &c, T &a, T &b) { mpz_divexact(c.z, a.z, b.z); }
-  static void gcd(T &u, T &v) { mpz_gcd(u.z, u.z, v.z); }
-  void lcm(T &a, const T &b) {
-    mpz_set(t1.z, a.z);
-    mpz_gcd(t1.z, t1.z, b.z);
-    mpz_divexact(t2.z, a.z, t1.z);
-    mpz_mul(a.z, t2.z, b.z);
   }
   static double to_double(const T &a) { return mpz_get_d(a.z); }
 

@@ -145,7 +145,7 @@ template <class Ar> struct Problem {
       free_list.pop_back();
       p->d = nvars;
     } else {
-      pool.emplace_back(new D(m, nvars));
+      pool.push_back(std::make_unique<D>(m, nvars));
       ++dicts_allocated;
       p = pool.back().get();
     }

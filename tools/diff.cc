@@ -1,5 +1,9 @@
-// Differential test: stripped LRSNash vs upstream lrsnash binary.
-#include "lib.h"
+// Differential test: the legacy library vs an upstream lrsnash binary.
+// Build against the legacy archive (L from tools/instrument_legacy.py L),
+// with the objects of one legacy arithmetic type, e.g. GMP:
+//   g++ -O2 -std=c++17 -IL tools/diff.cc L/legacy/gmp_*.o -lgmp -o diff
+//   ./diff upstream_bin fast|full trials maxdim maxval seed
+#include "legacy/lib.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

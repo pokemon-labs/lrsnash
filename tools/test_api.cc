@@ -3,17 +3,19 @@
 // full legacy output sequence, solve(GeneralSumGame*, Last) the last legacy
 // pair, solve(GeneralSumGame*, First) the first legacy pair. On constant-sum
 // games the ConstantSumGame overloads (extreme_equilibria, solve Last/First)
-// must give exactly the general-sum results on (a, den - a). "legacy float
+// must give exactly the general-sum results on (a, den - a), and the exact
+// visitor must give exactly extreme_equilibria's results. "legacy float
 // output differs" counts games where legacy's own float output is wrong
 // (mptoi truncates numerators that exceed long); it is informational, not a
 // mismatch.
 // Needs a legacy GMP build that records every lrs_nashoutput call into
-// g_seq; create it with tools/instrument_legacy.py:
-//   python3 tools/instrument_legacy.py /tmp/legacy && cd /tmp/legacy &&
-//   for f in lib lrslib lrsgmp; do g++ -O2 -c -I. $f.cc -DGMP -w -fpermissive; done
-//   g++ -O2 -std=c++17 -Isrc tools/test_api.cc /tmp/legacy/*.o -lgmp -o test_api
+// g_seq; create it from the `legacy` tag with tools/instrument_legacy.py:
+//   python3 tools/instrument_legacy.py L && (cd L/legacy &&
+//   for f in lib lrslib lrsgmp; do g++ -O2 -c -I. $f.cc -DGMP -w -fpermissive -o gmp_$f.o; done)
+//   g++ -O2 -std=c++17 -Isrc -IL tools/test_api.cc L/legacy/gmp_*.o -lgmp -o test_api
 //   ./test_api trials maxdim seed
 #include "lrsnash/solve.hpp"
+#include "legacy/lib.h"
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -36,6 +38,22 @@ static bool same(const std::vector<std::vector<double>> &x, const std::vector<st
   for (size_t i = 0; i < x.size(); i++) { if (x[i].size() != y[i].size()) return false; for (size_t j = 0; j < x[i].size(); j++) if (!close(x[i][j], y[i][j])) return false; }
   return true;
 }
+// the exact visitor's pairs, converted the way extreme_equilibria converts
+template <class S, class G> static std::vector<Equilibrium> exact_as_double(S &s, const G *g, int den) {
+  std::vector<Equilibrium> r;
+  s.extreme_equilibria(g, [&](const auto &e) {
+    using Ar = typename std::decay_t<decltype(e)>::arith;
+    Equilibrium q;
+    const double dx = Ar::to_double(e.x[0]), dy = Ar::to_double(e.y[0]);
+    if (!(dx > 0 && dy > 0)) q.payoff1 = NAN;  // denominators must be positive
+    for (long i = 0; i < e.rows; i++) q.x.push_back(Ar::to_double(e.x[i + 1]) / dx);
+    for (long j = 0; j < e.cols; j++) q.y.push_back(Ar::to_double(e.y[j + 1]) / dy);
+    if (q.payoff1 == 0) q.payoff1 = Ar::to_double(e.y[e.cols + 1]) / dy / den;
+    q.payoff2 = Ar::to_double(e.x[e.rows + 1]) / dx / den;
+    r.push_back(q);
+  });
+  return r;
+}
 static bool same_eqs(const std::vector<Equilibrium> &p, const std::vector<Equilibrium> &q) {
   if (p.size() != q.size()) return false;
   for (size_t k = 0; k < p.size(); k++)
@@ -43,13 +61,14 @@ static bool same_eqs(const std::vector<Equilibrium> &p, const std::vector<Equili
   return true;
 }
 template <class S> struct Check {
-  const char *name; S s; long bad_all = 0, bad_last = 0, bad_first = 0, bad_cs = 0, legacy_float_diff = 0, ovf = 0, n = 0;
+  const char *name; S s; long bad_all = 0, bad_last = 0, bad_first = 0, bad_cs = 0, bad_exact = 0, legacy_float_diff = 0, ovf = 0, n = 0;
   void run(long m, long n_, std::vector<int> &a, std::vector<int> &b, int den, bool constant_sum,
            const std::vector<std::vector<double>> &L, const std::vector<float> &lrs, const std::vector<float> &lcs, float lval) {
     try {
       GeneralSumGame in{m, n_, den, a.data(), b.data()};
       auto all = s.extreme_equilibria(&in);
       if (!same(as_seq(all, den), L)) ++bad_all;
+      if (!same_eqs(exact_as_double(s, &in, den), all)) ++bad_exact;
       std::vector<float> rs(m + 2, -7.f), cs(n_ + 2, -7.f); FloatEquilibrium out{rs.data(), cs.data(), 0.f};
       s.solve(&in, &out, Mode::Last);
       // vs the last pair of legacy's exact output sequence (the real gate)
@@ -74,7 +93,7 @@ template <class S> struct Check {
       if (!ok) ++bad_first;
       if (constant_sum) {  // b == den - a: the ConstantSumGame overloads must agree exactly
         ConstantSumGame cg{m, n_, a.data(), den};
-        ok = same_eqs(s.extreme_equilibria(&cg), all);
+        ok = same_eqs(s.extreme_equilibria(&cg), all) && same_eqs(exact_as_double(s, &cg, den), all);
         for (Mode md : {Mode::Last, Mode::First}) {
           std::vector<float> r1(m), c1(n_), r2(m), c2(n_);
           FloatEquilibrium o1{r1.data(), c1.data(), 0.f}, o2{r2.data(), c2.data(), 0.f};
@@ -87,7 +106,7 @@ template <class S> struct Check {
       ++n;
     } catch (overflow_error &) { ++ovf; }
   }
-  void report() { printf("  %-10s games=%ld  all-seq mismatches=%ld  last mismatches=%ld  first mismatches=%ld  constant-sum overload mismatches=%ld  overflow=%ld  (legacy float output differs: %ld)\n", name, n, bad_all, bad_last, bad_first, bad_cs, ovf, legacy_float_diff); }
+  void report() { printf("  %-10s games=%ld  all-seq mismatches=%ld  last mismatches=%ld  first mismatches=%ld  constant-sum overload mismatches=%ld  exact visitor mismatches=%ld  overflow=%ld  (legacy float output differs: %ld)\n", name, n, bad_all, bad_last, bad_first, bad_cs, bad_exact, ovf, legacy_float_diff); }
 };
 int main(int argc, char **argv) {
   int trials = atoi(argv[1]), maxdim = atoi(argv[2]); std::mt19937 gen(atoi(argv[3]));

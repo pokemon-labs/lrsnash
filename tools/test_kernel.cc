@@ -187,7 +187,8 @@ static void boundary(std::mt19937_64 &g, Stats &st) {
   GMP gm;
   Ar ar;
   choose_kernel(ar);
-  // cols up to 13: the AVX2 kernel only runs for rows of 8 or more entries
+  // cols up to 13: the AVX2 kernel only runs for rows of at least
+  // I64::kAvx2MinCols (7) entries
   const long rows = 2 + (long)(g() % 4), cols = 2 + (long)(g() % 12), stride = cols;
   const long r = (long)(g() % rows), s = (long)(g() % cols);
   const int k = (int)(g() % (w - 3));  // det = 2^k e' must fit with room for m

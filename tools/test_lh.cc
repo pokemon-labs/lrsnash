@@ -4,13 +4,18 @@
 // exactly the reported payoffs (GMP rational check). Also checks the public
 // API: solve(GeneralSumGame*, Mode::Any, label) runs Lemke-Howson with
 // missing label label + 1 and rejects labels outside [0, rows + cols); every
-// solve / extreme_equilibria overload rejects rows < 1 or cols < 1.
+// solve / extreme_equilibria overload rejects rows < 1, cols < 1 or den < 1.
+// RationalGame must give exactly the results of the same game scaled to
+// integers by hand (every overload, and the exact visitor), and reject bad
+// denominators and payoffs that do not fit.
 //   g++ -O2 -std=c++17 -Isrc tools/test_lh.cc -lgmp -o test_lh
 //   ./test_lh trials maxdim seed
 #include "lrsnash/lemke.hpp"
 #include "lrsnash/solve.hpp"
 #include <gmp.h>
+#include <cmath>
 #include <cstdio>
+#include <numeric>
 #include <random>
 #include <string>
 using namespace LRSNash; using namespace LRSNash::arith;
@@ -110,10 +115,81 @@ static bool dims_rejected() {
   }
   return true;
 }
+// every solve / extreme_equilibria overload rejects den < 1 with
+// invalid_argument, and accepts den = 1
+static bool den_rejected() {
+  std::vector<int> A{1, 0, 0, 1}, B{0, 1, 1, 0}; std::vector<float> rs(2), cs(2);
+  FloatEquilibrium out{rs.data(), cs.data(), 0.f};
+  for (int den : {0, -1, 1}) {
+    int caught = 0;
+    GeneralSumGame gs{2, 2, den, A.data(), B.data()}; ConstantSumGame cg{2, 2, A.data(), den};
+    for (Mode md : {Mode::Any, Mode::Last, Mode::First}) {
+      try { api.solve(&gs, &out, md); } catch (std::invalid_argument &) { ++caught; }
+      try { api.solve(&cg, &out, md); } catch (std::invalid_argument &) { ++caught; }
+    }
+    try { api.extreme_equilibria(&gs); } catch (std::invalid_argument &) { ++caught; }
+    try { api.extreme_equilibria(&cg); } catch (std::invalid_argument &) { ++caught; }
+    if (caught != (den < 1 ? 8 : 0)) return false;
+  }
+  return true;
+}
+// RationalGame vs the integer game scaled by hand; returns the mismatches
+template <class S> static long rational_mismatches(S &s, std::mt19937 &gen, int trials, int maxdim) {
+  long bad = 0;
+  for (int t = 0; t < trials; ++t) {
+    long m = std::uniform_int_distribution<int>(1, maxdim)(gen), n = std::uniform_int_distribution<int>(1, maxdim)(gen);
+    std::uniform_int_distribution<long> num(t % 2 ? -100 : 0, 100), den(1, 12);
+    std::vector<long> rn(m * n), rd(m * n), cn(m * n), cd(m * n);
+    for (long k = 0; k < m * n; k++) { rn[k] = num(gen); rd[k] = den(gen); cn[k] = num(gen); cd[k] = den(gen); }
+    long L1 = 1, L2 = 1;
+    for (long k = 0; k < m * n; k++) { L1 = std::lcm(L1, rd[k]); L2 = std::lcm(L2, cd[k]); }
+    std::vector<int> A(m * n), B(m * n);
+    for (long k = 0; k < m * n; k++) { A[k] = (int)(rn[k] * (L1 / rd[k])); B[k] = (int)(cn[k] * (L2 / cd[k])); }
+    RationalGame rg{m, n, rn.data(), rd.data(), cn.data(), cd.data()};
+    GeneralSumGame ig{m, n, 1, A.data(), B.data()};
+    auto er = s.extreme_equilibria(&rg), ei = s.extreme_equilibria(&ig);
+    bool ok = er.size() == ei.size();
+    for (size_t k = 0; ok && k < er.size(); k++)
+      ok = er[k].x == ei[k].x && er[k].y == ei[k].y && er[k].payoff1 == ei[k].payoff1 / L1 && er[k].payoff2 == ei[k].payoff2 / L2;
+    size_t k = 0;
+    s.extreme_equilibria(&rg, [&](const auto &e) {
+      using Ar = typename std::decay_t<decltype(e)>::arith;
+      const double dx = Ar::to_double(e.x[0]), dy = Ar::to_double(e.y[0]);
+      ok = ok && k < er.size() && e.scale1 == L1 && e.scale2 == L2 &&
+           Ar::to_double(e.y[e.cols + 1]) / dy / e.scale1 == er[k].payoff1 &&
+           Ar::to_double(e.x[e.rows + 1]) / dx / e.scale2 == er[k].payoff2;
+      for (long i = 0; ok && i < e.rows; i++) ok = Ar::to_double(e.x[i + 1]) / dx == er[k].x[i];
+      for (long j = 0; ok && j < e.cols; j++) ok = Ar::to_double(e.y[j + 1]) / dy == er[k].y[j];
+      ++k;
+    });
+    ok = ok && k == er.size();
+    std::vector<float> r1(m), c1(n), r2(m), c2(n);
+    FloatEquilibrium o1{r1.data(), c1.data(), 0.f}, o2{r2.data(), c2.data(), 0.f};
+    for (Mode md : {Mode::Any, Mode::Last, Mode::First}) {
+      const long label = md == Mode::Any ? t % (m + n) : 0;
+      s.solve(&rg, &o1, md, label);
+      s.solve(&ig, &o2, md, label);
+      ok = ok && r1 == r2 && c1 == c2 && std::fabs(o1.value - o2.value / L1) <= 1e-6f * std::max(1.f, std::fabs(o1.value));
+    }
+    if (!ok) ++bad;
+  }
+  // bad input: a denominator < 1, an lcm that does not fit, a scaled payoff > 2^62
+  long n1[2] = {1, 1}, d0[2] = {1, 0}, p1[2] = {4294967291, 4294967279}, p2[2] = {2147483587, 2147483579}, d1[2] = {1, 1};
+  long big[2] = {1L << 61, 1}, d3[2] = {1, 3};
+  std::vector<float> r(1), c(2); FloatEquilibrium o{r.data(), c.data(), 0.f};
+  RationalGame g0{1, 2, n1, d0, n1, d1}, g1{1, 2, n1, p1, n1, p2}, g2{1, 2, big, d3, n1, d1};
+  try { s.solve(&g0, &o); ++bad; } catch (std::invalid_argument &) {}
+  try { s.extreme_equilibria(&g1); ++bad; } catch (overflow_error &) {}
+  try { s.solve(&g2, &o, Mode::Last); ++bad; } catch (overflow_error &) {}
+  return bad;
+}
 int main(int argc, char **argv) {
   int trials = atoi(argv[1]), maxdim = atoi(argv[2]); std::mt19937 gen(atoi(argv[3]));
   long bad_k = 0, bad_eq = 0, bad_api = 0, o64 = 0, o128 = 0, runs = 0, piv = 0, maxpiv = 0;
   if (!dims_rejected()) ++bad_api;
+  if (!den_rejected()) ++bad_api;
+  { Solver autos; std::mt19937 g2(gen());
+    bad_api += rational_mismatches(api, g2, trials, maxdim) + rational_mismatches(autos, g2, trials, maxdim); }
   for (int t = 0; t < trials; ++t) {
     long m = std::uniform_int_distribution<int>(1, maxdim)(gen), n = std::uniform_int_distribution<int>(1, maxdim)(gen);
     int kind = t % 4; int vmax = kind == 0 ? 2 : kind == 1 ? 100 : kind == 2 ? 1000000 : 81;

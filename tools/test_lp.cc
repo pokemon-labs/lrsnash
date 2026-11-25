@@ -2,15 +2,20 @@
 //  * fast pivot kernels (I64, I128) give dictionaries bit-identical to the
 //    reference lrs pivot (dense_pivot) and to GMP and lrsmp;
 //  * every result is an exact equilibrium (GMP rational check);
-//  * optional: the value matches the legacy MP library (pass any 4th arg).
-// Build (repo root, legacy MP library from CMake in build/):
-//   g++ -O2 -std=c++17 -Isrc tools/test_lp.cc build/liblrslib.a -lgmp -o test_lp
+//  * optional: the value matches the legacy MP library (built with
+//    -DLRSNASH_TEST_LEGACY, pass any 4th arg).
+// Build (repo root):
+//   g++ -O2 -std=c++17 -Isrc tools/test_lp.cc -lgmp -o test_lp
+// With the legacy check (L from tools/instrument_legacy.py L, MP objects):
+//   g++ -O2 -std=c++17 -DLRSNASH_TEST_LEGACY -Isrc -IL tools/test_lp.cc L/legacy/mp_*.o -lgmp -o test_lp
 //   ./test_lp trials maxdim seed [legacy]
 // Tests for ZeroSumLP: (1) fast pivot kernels give bit-identical dictionaries
 // to the reference lrs pivot, (2) the result is an exact equilibrium,
 // (3) the value matches legacy solve_fast.
 #include "lrsnash/zerosum.hpp"
-#include "lib.h"
+#ifdef LRSNASH_TEST_LEGACY
+#include "legacy/lib.h"
+#endif
 #include <gmp.h>
 #include <cstdio>
 #include <random>
@@ -82,7 +87,11 @@ static bool verify(long m, long n, const std::vector<int> &A, const Exact &e, do
 
 int main(int argc, char **argv) {
   int trials = atoi(argv[1]), maxdim = atoi(argv[2]); unsigned seed = atoi(argv[3]);
+#ifdef LRSNASH_TEST_LEGACY
   bool legacy = argc > 4;
+#else
+  if (argc > 4) { fprintf(stderr, "built without -DLRSNASH_TEST_LEGACY\n"); return 1; }
+#endif
   std::mt19937 gen(seed);
   long bad_kernel = 0, bad_eq = 0, bad_val = 0, ovf64 = 0, ovf128 = 0, tot_piv = 0;
   for (int t = 0; t < trials; ++t) {
@@ -108,6 +117,7 @@ int main(int argc, char **argv) {
     double v;
     if (!verify(m, n, A, g, &v)) { ++bad_eq; printf("NOT AN EQUILIBRIUM t=%d m=%ld n=%ld\n", t, m, n); }
     tot_piv += g.pivots;
+#ifdef LRSNASH_TEST_LEGACY
     if (legacy && kind != 2) {  // legacy MP lib; den = vmax
       std::vector<float> rs(m + 2), cs(n + 2);
       FloatOneSumOutput out{rs.data(), cs.data(), 0.f};
@@ -116,6 +126,9 @@ int main(int argc, char **argv) {
       double lv = out.value * vmax;
       if (std::fabs(lv - v) > 1e-4 * std::max(1.0, std::fabs(v))) { ++bad_val; printf("VALUE MISMATCH t=%d legacy %g lp %g\n", t, lv, v); }
     }
+#else
+    (void)v;
+#endif
   }
   printf("trials=%d kernel_mismatch=%ld not_eq=%ld value_mismatch=%ld I64_overflow=%ld I128_overflow=%ld avg_pivots=%.2f\n", trials, bad_kernel, bad_eq, bad_val, ovf64, ovf128, (double)tot_piv / trials);
 }

@@ -90,6 +90,10 @@ template <class Ar> struct Nash {
     Q1.release_ring(P1);
   }
 
+  // Player 1's current vertex x, in on_eq1's layout. It is valid during the
+  // on_eq2 calls of its face too, as it is computed before the face.
+  const T *vertex1() const { return out1.data(); }
+
   // pivots done by the last solve (both players), for tests and benchmarks
   long pivot_count() const { return Q1.pivots + Q2.pivots; }
   // dictionaries allocated so far (cumulative). A repeat solve of the same

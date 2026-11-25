@@ -20,8 +20,13 @@
 // the method says what is returned.
 //
 //                      one equilibrium (Mode)      every extreme equilibrium
-//   ConstantSumGame    solve(&g, &out, mode)       extreme_equilibria(&g)
-//   GeneralSumGame     solve(&g, &out, mode, k)    extreme_equilibria(&g)
+//   ConstantSumGame    solve(&g, &out, mode)       extreme_equilibria(&g[, f])
+//   GeneralSumGame     solve(&g, &out, mode, k)    extreme_equilibria(&g[, f])
+//   RationalGame       solve(&g, &out, mode, k)    extreme_equilibria(&g[, f])
+//
+// RationalGame is a general-sum game with num/den payoffs. extreme_equilibria
+// returns doubles, or with a callback f gives each equilibrium exactly
+// (ExactEquilibrium).
 //
 // solve(const ConstantSumGame*), by Mode:
 //   Any (default) - one exact LP (zerosum.hpp). It returns an optimal
@@ -47,17 +52,17 @@
 //
 // Output of solve: row_strategy[0..rows-1], col_strategy[0..cols-1] (exactly
 // that many entries are written) and value = player 1's payoff / den, as in
-// legacy. Every method throws std::invalid_argument unless rows >= 1 and
-// cols >= 1.
+// legacy. Every method throws std::invalid_argument unless rows >= 1,
+// cols >= 1 and den >= 1 (every denominator >= 1 for a RationalGame).
 #pragma once
 
+#include <numeric>
 #include <stdexcept>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-#include "../lib.h"
 #include "arith.hpp"
 #include "lemke.hpp"
 #include "nash.hpp"
@@ -65,26 +70,77 @@
 
 namespace LRSNash {
 
-// The game and output types. Until lib.h is switched over to this API they
-// are the legacy lib.h structs under new names; then the definitions move
-// here and the legacy names go.
-//   ConstantSumGame{rows, cols, data, den}: player 1's payoff is data
-//       (row-major rows x cols), player 2's is den - data.
-//   GeneralSumGame{rows, cols, den, row_data, col_data}: player 1's and
-//       player 2's payoffs (row-major); den only scales the reported payoffs.
-//   FloatEquilibrium{row_strategy, col_strategy, value}: caller-owned
-//       arrays of rows and cols floats, and value (see above).
-using ConstantSumGame = FastInput;
-using GeneralSumGame = Input;
-using FloatEquilibrium = FloatOneSumOutput;
+// The game and output types (the legacy FastInput, Input and
+// FloatOneSumOutput, with the same fields). den must be >= 1. A zero-sum
+// game is a constant-sum game with any den >= 1: the strategies are the
+// same, and value is scaled by 1/den.
+
+// Player 1's payoff is data (row-major rows x cols), player 2's is
+// den - data.
+struct ConstantSumGame {
+  long rows;
+  long cols;
+  const int *data;
+  int den;
+};
+
+// Player 1's and player 2's payoffs (row-major rows x cols). den only
+// scales the reported payoffs.
+struct GeneralSumGame {
+  long rows;
+  long cols;
+  int den;
+  const int *row_data;
+  const int *col_data;
+};
+
+// A general-sum game with rational payoffs: player 1's payoff at (i, j) is
+// row_num[k] / row_den[k] and player 2's is col_num[k] / col_den[k], with
+// k = i * cols + j. Every denominator must be >= 1. The solvers scale each
+// player's matrix by the lcm of its denominators, which changes no best
+// response, and report payoffs and value in these true units. They throw
+// overflow_error if an lcm does not fit in long, or if a scaled payoff a has
+// |a| > 2^62 (one bit of headroom for the solvers' shifts and negations).
+struct RationalGame {
+  long rows;
+  long cols;
+  const long *row_num, *row_den;
+  const long *col_num, *col_den;
+};
+
+// Caller-owned arrays of rows and cols floats, and value = player 1's
+// payoff / den (true units for a RationalGame).
+struct FloatEquilibrium {
+  float *row_strategy;
+  float *col_strategy;
+  float value;
+};
 
 enum class Mode { Last, First, Any };
 
 // One extreme equilibrium. Payoffs are divided by den, like
-// FloatEquilibrium::value.
+// FloatEquilibrium::value (true units for a RationalGame).
 struct Equilibrium {
   std::vector<double> x, y;
   double payoff1 = 0, payoff2 = 0;
+};
+
+// One extreme equilibrium, exactly, in the arithmetic type Ar that computed
+// it (Ar::T is int64_t, __int128, lrsmp's digit array or a GMP integer; use
+// Ar::to_double, or the type itself). Integers over a common denominator:
+//   x[1..rows] / x[0]   player 1's strategy,  x[rows+1] / x[0]  player 2's payoff
+//   y[1..cols] / y[0]   player 2's strategy,  y[cols+1] / y[0]  player 1's payoff
+// The denominators are positive. The payoffs are in the units of the
+// matrices the solver used; divide player k's by scale_k for the value the
+// double-valued API reports: den for a ConstantSumGame or GeneralSumGame,
+// the lcm of player k's denominators for a RationalGame. The arrays are
+// valid only during the callback.
+template <class Ar> struct ExactEquilibrium {
+  using arith = Ar;
+  using T = typename Ar::T;
+  long rows, cols;
+  const T *x, *y;
+  long scale1, scale2;
 };
 
 namespace detail {
@@ -113,14 +169,14 @@ template <class Ar> struct FloatEq {
 template <class Ar> struct AllEq {
   std::vector<Equilibrium> *out;
   long rows, cols;
-  double den;
+  double den1, den2;  // player 1's and player 2's payoff scale
   size_t pending = 0;  // first equilibrium of the current x
   bool on_eq2(const typename Ar::T *o, long) {
     const double d = Ar::to_double(o[0]);
     Equilibrium e;
     e.y.resize(cols);
     for (long j = 0; j < cols; j++) e.y[j] = Ar::to_double(o[j + 1]) / d;
-    e.payoff1 = Ar::to_double(o[cols + 1]) / d / den;
+    e.payoff1 = Ar::to_double(o[cols + 1]) / d / den1;
     out->push_back(std::move(e));
     return true;
   }
@@ -128,7 +184,7 @@ template <class Ar> struct AllEq {
     const double d = Ar::to_double(o[0]);
     std::vector<double> x(rows);
     for (long i = 0; i < rows; i++) x[i] = Ar::to_double(o[i + 1]) / d;
-    const double v = Ar::to_double(o[rows + 1]) / d / den;
+    const double v = Ar::to_double(o[rows + 1]) / d / den2;
     for (size_t k = pending; k < out->size(); k++) {
       (*out)[k].x = x;
       (*out)[k].payoff2 = v;
@@ -138,10 +194,38 @@ template <class Ar> struct AllEq {
   }
 };
 
+// Visitor that passes each (x, y) pair to f as computed. x is read from the
+// enumeration's current player-1 vertex, which exists before its face.
+template <class Ar, class F> struct ExactEq {
+  const Nash<Ar> *en;
+  long rows, cols, scale1, scale2;
+  F *f;
+  bool on_eq2(const typename Ar::T *y, long) {
+    (*f)(ExactEquilibrium<Ar>{rows, cols, en->vertex1(), y, scale1, scale2});
+    return true;
+  }
+  bool on_eq1(const typename Ar::T *, long) { return true; }
+};
+
+// Visitor that copies each (x, y) pair into buf (rows+2 then cols+2 values).
+template <class Ar> struct BufferEq {
+  const Nash<Ar> *en;
+  long rows, cols;
+  std::vector<typename Ar::T> *buf;
+  bool on_eq2(const typename Ar::T *y, long) {
+    const typename Ar::T *x = en->vertex1();
+    buf->insert(buf->end(), x, x + rows + 2);
+    buf->insert(buf->end(), y, y + cols + 2);
+    return true;
+  }
+  bool on_eq1(const typename Ar::T *, long) { return true; }
+};
+
 template <class Ar> struct Workspace {
   ZeroSumLP<Ar> lp;
   LemkeHowson<Ar> lh;
   Nash<Ar> en;
+  std::vector<typename Ar::T> buf;  // exact pairs of a type that may overflow
 };
 
 }  // namespace detail
@@ -156,7 +240,8 @@ template <class... Ars> class SolverT {
   //                         exactly the legacy solve_fast result.
   void solve(const ConstantSumGame *g, FloatEquilibrium *out, Mode mode = Mode::Any) {
     const long m = g->rows, n = g->cols;
-    check_dims(m, n, "solve: rows and cols must be >= 1");
+    require(m >= 1 && n >= 1, "solve: rows and cols must be >= 1");
+    require(g->den >= 1, "solve: den must be >= 1");
     const int *a = g->data;
     const long den = g->den;
     auto A = [a, n](long i, long j) { return (long)a[i * n + j]; };
@@ -181,14 +266,135 @@ template <class... Ars> class SolverT {
   void solve(const GeneralSumGame *g, FloatEquilibrium *out, Mode mode = Mode::Any,
              long missing_label = 0) {
     const long m = g->rows, n = g->cols;
-    check_dims(m, n, "solve: rows and cols must be >= 1");
+    require(m >= 1 && n >= 1, "solve: rows and cols must be >= 1");
+    require(g->den >= 1, "solve: den must be >= 1");
     const int *a = g->row_data, *b = g->col_data;
     auto A = [a, n](long i, long j) { return (long)a[i * n + j]; };
     auto B = [b, n](long i, long j) { return (long)b[i * n + j]; };
+    solve_general(m, n, A, B, out, mode, missing_label, g->den);
+  }
+
+  // One equilibrium of a game with rational payoffs, as for GeneralSumGame.
+  void solve(const RationalGame *g, FloatEquilibrium *out, Mode mode = Mode::Any,
+             long missing_label = 0) {
+    const long m = g->rows, n = g->cols;
+    require(m >= 1 && n >= 1, "solve: rows and cols must be >= 1");
+    const long s1 = scale_rational(g->row_num, g->row_den, m * n, ra);
+    scale_rational(g->col_num, g->col_den, m * n, rb);
+    const long *a = ra.data(), *b = rb.data();
+    auto A = [a, n](long i, long j) { return a[i * n + j]; };
+    auto B = [b, n](long i, long j) { return b[i * n + j]; };
+    solve_general(m, n, A, B, out, mode, missing_label, s1);
+  }
+
+  // Every extreme equilibrium of a constant-sum game: the enumeration on
+  // (data, den - data).
+  std::vector<Equilibrium> extreme_equilibria(const ConstantSumGame *g) {
+    std::vector<Equilibrium> all;
+    with_game(g, [&](long m, long n, auto A, auto B, long s1, long s2) {
+      collect_all(m, n, A, B, s1, s2, all);
+    });
+    return all;
+  }
+  // Every extreme equilibrium of a general-sum game.
+  std::vector<Equilibrium> extreme_equilibria(const GeneralSumGame *g) {
+    std::vector<Equilibrium> all;
+    with_game(g, [&](long m, long n, auto A, auto B, long s1, long s2) {
+      collect_all(m, n, A, B, s1, s2, all);
+    });
+    return all;
+  }
+  // Every extreme equilibrium of a game with rational payoffs.
+  std::vector<Equilibrium> extreme_equilibria(const RationalGame *g) {
+    std::vector<Equilibrium> all;
+    with_game(g, [&](long m, long n, auto A, auto B, long s1, long s2) {
+      collect_all(m, n, A, B, s1, s2, all);
+    });
+    return all;
+  }
+
+  // Every extreme equilibrium, exactly: f(const ExactEquilibrium<Ar> &) is
+  // called once per equilibrium, in the order of extreme_equilibria. Ar is
+  // the arithmetic type that finished, so f is usually a generic lambda.
+  // Types before the last one keep their results until they finish without
+  // overflow, so f never sees a partial result. The last (or only) type
+  // passes them on as computed: if it throws overflow_error, f has already
+  // seen some.
+  template <class G, class F> void extreme_equilibria(const G *g, F &&f) {
+    with_game(g, [&](long m, long n, auto A, auto B, long s1, long s2) {
+      visit_exact<0>(m, n, A, B, s1, s2, f);
+    });
+  }
+
+ private:
+  static void require(bool ok, const char *msg) {
+    if (!ok) throw std::invalid_argument(msg);
+  }
+
+  // Check a game and call body(m, n, A, B, scale1, scale2) with its payoff
+  // functions. The solvers need a real game (nash.hpp's lrs systems also
+  // rely on it: with rows, cols >= 1 the payoff rows give them full column
+  // rank), and the reported payoffs are divided by the scales.
+  template <class Body> void with_game(const ConstantSumGame *g, Body &&body) {
+    const long m = g->rows, n = g->cols;
+    require(m >= 1 && n >= 1, "extreme_equilibria: rows and cols must be >= 1");
+    require(g->den >= 1, "extreme_equilibria: den must be >= 1");
+    const int *a = g->data;
+    const long den = g->den;
+    auto A = [a, n](long i, long j) { return (long)a[i * n + j]; };
+    auto B = [a, n, den](long i, long j) { return den - (long)a[i * n + j]; };
+    body(m, n, A, B, den, den);
+  }
+  template <class Body> void with_game(const GeneralSumGame *g, Body &&body) {
+    const long m = g->rows, n = g->cols;
+    require(m >= 1 && n >= 1, "extreme_equilibria: rows and cols must be >= 1");
+    require(g->den >= 1, "extreme_equilibria: den must be >= 1");
+    const int *a = g->row_data, *b = g->col_data;
+    auto A = [a, n](long i, long j) { return (long)a[i * n + j]; };
+    auto B = [b, n](long i, long j) { return (long)b[i * n + j]; };
+    body(m, n, A, B, (long)g->den, (long)g->den);
+  }
+  template <class Body> void with_game(const RationalGame *g, Body &&body) {
+    const long m = g->rows, n = g->cols;
+    require(m >= 1 && n >= 1, "extreme_equilibria: rows and cols must be >= 1");
+    const long s1 = scale_rational(g->row_num, g->row_den, m * n, ra);
+    const long s2 = scale_rational(g->col_num, g->col_den, m * n, rb);
+    const long *a = ra.data(), *b = rb.data();
+    auto A = [a, n](long i, long j) { return a[i * n + j]; };
+    auto B = [b, n](long i, long j) { return b[i * n + j]; };
+    body(m, n, A, B, s1, s2);
+  }
+
+  // out[k] = num[k] * (L / den[k]) with L the lcm of den[0..count-1];
+  // returns L. See RationalGame for the limits.
+  static long scale_rational(const long *num, const long *den, long count,
+                             std::vector<long> &out) {
+    long L = 1;
+    for (long k = 0; k < count; k++) {
+      require(den[k] >= 1, "RationalGame: denominators must be >= 1");
+      const long g = std::gcd(L, den[k]);
+      if (__builtin_mul_overflow(L / g, den[k], &L))
+        throw overflow_error("RationalGame: lcm of the denominators");
+    }
+    out.resize(count);
+    constexpr long lim = 1L << 62;
+    for (long k = 0; k < count; k++) {
+      long a;
+      if (__builtin_mul_overflow(num[k], L / den[k], &a) || a > lim || a < -lim)
+        throw overflow_error("RationalGame: scaled payoff exceeds 2^62");
+      out[k] = a;
+    }
+    return L;
+  }
+
+  // solve for a general-sum game; value is player 1's payoff / scale1
+  template <class FA, class FB>
+  void solve_general(long m, long n, FA A, FB B, FloatEquilibrium *out, Mode mode,
+                     long missing_label, long scale1) {
     double v = 0;
     if (mode == Mode::Any) {
-      if (missing_label < 0 || missing_label >= m + n)
-        throw std::invalid_argument("solve: missing_label must be in [0, rows + cols)");
+      require(missing_label >= 0 && missing_label < m + n,
+              "solve: missing_label must be in [0, rows + cols)");
       attempt([&](auto &w) {
         w.lh.setup(m, n, A, B);
         w.lh.run(missing_label + 1);  // lemke.hpp labels are 1-based
@@ -198,36 +404,7 @@ template <class... Ars> class SolverT {
       enumerate(m, n, A, B, mode, out);
       v = out_value;
     }
-    out->value = (float)(v / g->den);
-  }
-
-  // Every extreme equilibrium of a constant-sum game: the enumeration on
-  // (data, den - data).
-  std::vector<Equilibrium> extreme_equilibria(const ConstantSumGame *g) {
-    const long m = g->rows, n = g->cols;
-    check_dims(m, n, "extreme_equilibria: rows and cols must be >= 1");
-    const int *a = g->data;
-    const long den = g->den;
-    auto A = [a, n](long i, long j) { return (long)a[i * n + j]; };
-    auto B = [a, n, den](long i, long j) { return den - (long)a[i * n + j]; };
-    return collect_all(m, n, A, B, den);
-  }
-
-  // Every extreme equilibrium of a general-sum game.
-  std::vector<Equilibrium> extreme_equilibria(const GeneralSumGame *g) {
-    const long m = g->rows, n = g->cols;
-    check_dims(m, n, "extreme_equilibria: rows and cols must be >= 1");
-    const int *a = g->row_data, *b = g->col_data;
-    auto A = [a, n](long i, long j) { return (long)a[i * n + j]; };
-    auto B = [b, n](long i, long j) { return (long)b[i * n + j]; };
-    return collect_all(m, n, A, B, g->den);
-  }
-
- private:
-  // The solvers need a real game. (nash.hpp's lrs systems also rely on it:
-  // with rows, cols >= 1 the payoff rows give them full column rank.)
-  static void check_dims(long rows, long cols, const char *msg) {
-    if (rows < 1 || cols < 1) throw std::invalid_argument(msg);
+    out->value = (float)(v / scale1);
   }
 
   // LP in type I; before a pivot that might not fit, promote the dictionary
@@ -277,17 +454,39 @@ template <class... Ars> class SolverT {
     for (long j = 0; j < n; j++) out->col_strategy[j] = ys[j];
   }
 
-  // every extreme equilibrium, payoffs divided by den
+  // every extreme equilibrium, player k's payoffs divided by scale_k
   template <class FA, class FB>
-  std::vector<Equilibrium> collect_all(long m, long n, FA A, FB B, long den) {
-    std::vector<Equilibrium> all;
+  void collect_all(long m, long n, FA A, FB B, long scale1, long scale2,
+                   std::vector<Equilibrium> &all) {
     attempt([&](auto &w) {
       using Ar = typename std::decay_t<decltype(w.en)>::T_ar;
       all.clear();  // drop a partial result from a type that overflowed
-      detail::AllEq<Ar> vis{&all, m, n, (double)den};
+      detail::AllEq<Ar> vis{&all, m, n, (double)scale1, (double)scale2};
       w.en.solve(m, n, A, B, vis);
     });
-    return all;
+  }
+
+  // extreme_equilibria with an exact visitor, from type I on
+  template <size_t I, class FA, class FB, class F>
+  void visit_exact(long m, long n, FA A, FB B, long scale1, long scale2, F &f) {
+    auto &w = std::get<I>(ws);
+    using Ar = typename std::decay_t<decltype(w.en)>::T_ar;
+    if constexpr (I + 1 == sizeof...(Ars)) {
+      detail::ExactEq<Ar, F> vis{&w.en, m, n, scale1, scale2, &f};
+      w.en.solve(m, n, A, B, vis);  // last type: overflow propagates
+    } else {
+      w.buf.clear();
+      detail::BufferEq<Ar> vis{&w.en, m, n, &w.buf};
+      try {
+        w.en.solve(m, n, A, B, vis);
+      } catch (overflow_error &) {
+        visit_exact<I + 1>(m, n, A, B, scale1, scale2, f);
+        return;
+      }
+      const std::size_t len = (std::size_t)(m + n + 4);
+      for (std::size_t k = 0; k < w.buf.size(); k += len)
+        f(ExactEquilibrium<Ar>{m, n, &w.buf[k], &w.buf[k + m + 2], scale1, scale2});
+    }
   }
 
   // run f(workspace) with each arithmetic type in turn until one fits
@@ -307,6 +506,7 @@ template <class... Ars> class SolverT {
 
   std::tuple<detail::Workspace<Ars>...> ws;
   std::vector<float> xs, ys;
+  std::vector<long> ra, rb;  // a RationalGame's scaled payoffs
   double out_value = 0;
 };
 
