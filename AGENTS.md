@@ -2,8 +2,8 @@
 
 This file holds the background, goals, constraints and plan for the ongoing
 verification, optimization and C++ rewrite work on this repo. Read it before
-making changes. `PERFORMANCE.md` explains the performance work in detail: what
-was measured, why each change was tried, and what it gained.
+making changes. `PERFORMANCE.md` explains the performance changes, biggest
+first: what each one does, why it keeps results exact, and what it gained.
 
 **Branches.** All work since the initial stripped port lives on the `rewrite`
 branch: this file, `PERFORMANCE.md`, `src/lrsnash/` and the new `tools/`.
@@ -161,7 +161,7 @@ last equilibrium.
    - an AVX2 kernel with runtime dispatch.
 
    Not done: a fixed 256/512-bit type. More ideas are in PERFORMANCE.md
-   section 8.
+   section 7.
 6. **C++ rewrite.** Done in session 7 for 6.1-6.6, except as noted. Turn the
    header-only port into the only
    implementation, written as idiomatic modern C++ (C++17). It must keep the
@@ -676,7 +676,7 @@ option except for the performance follow-ups, where they chose "both".
     lead): do both, and keep whatever wins.**
     - Time the AVX2 cut-over (`kAvx2MinCols`, now 8 columns).
     - Try a thin `I64::pivot` dispatcher for the small-game residual
-      (PERFORMANCE.md 10.6).
+      (PERFORMANCE.md 6.3).
 
 ## Open questions (for the user)
 
@@ -816,7 +816,7 @@ Answered so far:
    - Kernel fixes: the int128 regression from session 5, and the int128
      shift specializations.
    - **Final timing (session 7)**, against `18834e9`. The table is in
-     PERFORMANCE.md section 10 and in the session 7 notes.
+     the PERFORMANCE.md appendix and in the session 7 notes.
      - Default (AVX2) build: LP 6x6 -6%, 9x9 -10%, 15x15 -12% to -15%; LH
        6x6 -15%, 9x9 -29% to -31%, 15x15 -43% to -45%; Last/First -17% to
        -25%.
@@ -859,7 +859,7 @@ Answered so far:
    and `RationalGame` (decision 12).
 7. Committed (session 7). Downstream must now move to the new `lib.h` (its
    header lists the replacements for `solve_fast` / `solve_full`). Open: Q9.
-   Optional: PERFORMANCE.md section 8 (the float-guided exact LP is the
+   Optional: PERFORMANCE.md section 7 (the float-guided exact LP is the
    biggest lever left), and an idiomatic rewrite of the lrsmp port
    (`MP<W>`, used only by `SolverMP`).
 
@@ -1234,7 +1234,7 @@ Answered so far:
   which is noise.
 - **Timing of `b37a781`** (µs per game; percentages against `18834e9`;
   "plain" = `-DLRSNASH_NO_AVX2`). The follow-ups below changed this; the
-  final table is in PERFORMANCE.md section 10.
+  final table is in the PERFORMANCE.md appendix.
 
   | case | `18834e9` | plain | AVX2 (default) |
   |---|---|---|---|
@@ -1262,10 +1262,10 @@ Answered so far:
   - A lead that was not followed: in step 2's variant, `pivot` had become a
     small dispatcher, and GCC inlined the plain kernel into its callers. In
     the default build that variant had 4x4 and 6x6 LPs level with
-    `18834e9` (-0.5% and -0.1%, one run). See PERFORMANCE.md 10.6.
+    `18834e9` (-0.5% and -0.1%, one run). Decision 17 followed it up (below).
 - **Decisions 10-17** were answered by the user. That closes every open
   question; see "Decisions".
-- **Decision 17's follow-ups, both kept** (details in PERFORMANCE.md 10.6):
+- **Decision 17's follow-ups, both kept** (see also PERFORMANCE.md 6.1 and 6.3):
   - `always_inline` on `I64::pivot`, so the plain kernel is part of each
     caller and the AVX2 kernel stays out of line. Of three variants (GCC's
     choice, forced inline, forced out of line), only forced inline is both
