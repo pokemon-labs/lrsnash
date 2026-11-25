@@ -254,10 +254,12 @@ options were measured:
 - **Lemke-Howson (`Mode::Any`, `src/lrsnash/lemke.hpp`).** Complementary
   pivoting follows one path from the artificial equilibrium (0,0) to a real
   one, usually in a handful of pivots. Implementation:
-  - both tableaus store all variables, with column c holding the variable
-    with label c, so "enter the complement" means "the same column in the
-    other tableau";
-  - the full-tableau Bareiss pivot uses the same fast exact kernel;
+  - first version: both tableaus stored all variables, with column c holding
+    the variable with label c, so "enter the complement" meant "the same
+    column in the other tableau";
+  - the full-tableau Bareiss pivot used the same fast exact kernel. Since
+    the second round each polytope is an lrs dictionary, which does half the
+    work for the same path (section 10.2);
   - degeneracy is handled by the lexicographic ratio test over the slack
     columns (= det·B⁻¹), which never ties.
 
@@ -313,15 +315,35 @@ was not needed there.
 
 ## 8. Remaining opportunities
 
-- A branch-light `lrs_ratio`/`reverse`/`lexmin` for the fixed-width types.
-  P1's reverse search is about half of Last-mode time.
-- An AVX2 kernel (emulated 64-bit multiplies) behind a target attribute with
-  runtime dispatch: maybe 1.5–2x on the kernel.
-- A fixed 256/512-bit integer type with the same modular trick for 30x30 and
-  larger, where GMP dominates: the LP takes 1.1 ms at 30x30 and 23 ms at
-  50x50.
-- Stack storage or compile-time size bounds for tiny games, and the
-  "promotion" idea for the enumeration path.
+The branch-light reverse search and the AVX2 kernel from the first version
+of this list were done in the second round (section 10). Still open:
+
+- **A narrow path for int128 dictionaries with small entries.**
+  - While every entry fits in 64 bits, one pivot entry costs three 64-bit
+    multiplies instead of six (or 128-bit storage with the I64 arithmetic).
+  - This helps `Solver128`, and the int128 restarts of the auto chain for
+    Lemke-Howson and the enumeration.
+  - It needs a bound that says "fits in int64": `hmag` (the high word) does
+    not.
+- **A float-guided exact LP for constant-sum games.**
+  - Find the optimal basis with a double-precision simplex, solve that basis
+    exactly (one small Bareiss solve), and check optimality exactly. Fall
+    back to the exact simplex if the check fails.
+  - The 9x9 LP is 70% kernel over about 8 pivots, so this could roughly
+    halve it.
+  - It can return a different optimal pair than today's `Mode::Any` in
+    degenerate games, which is allowed but is a behaviour change.
+- **A thin `I64::pivot` dispatcher**, so that GCC can inline the plain
+  kernel into its callers. This targets the small-game residual of the
+  default build (section 10.6): a few ns per game below 8 columns.
+- **Padding LP/LH rows to a multiple of 4** so that the AVX2 loop needs no
+  scalar epilogue. By instruction count this is about even at 9x9 (3 vector
+  iterations against 2 plus 2 scalar entries), so it waits for timing.
+- **A fixed 256/512-bit integer type** with the same modular trick, for
+  30x30 and larger, where GMP dominates: the LP takes 1.1 ms at 30x30 and
+  23 ms at 50x50.
+- **Inline storage for solvers that are constructed per call**
+  (CONTEXT.md Q6), and the "promotion" idea for the enumeration path.
 
 ## 9. Bug found along the way
 
@@ -329,6 +351,244 @@ Legacy returns a wrong game **value** on about 0.4% of 9x9 games with
 payoffs 0..1000, for example 0.0054 instead of 0.4374. `mptoi` truncates the
 payoff numerator (about payoff × denominator) to `long`, while the strategy
 numerators still fit. The new code converts exact values to double directly.
+
+## 10. Second round (2026-11-24)
+
+The user was running their own benchmarks during most of this round, so
+after a first set of native measurements the evidence was callgrind
+instruction counts. These are deterministic and do not depend on machine
+load, and they are backed by reading the generated code.
+
+The final state, after the fix in section 10.6, was then timed natively:
+`-O3 -DNDEBUG`, pinned to one core, best of 5, the three builds
+alternating. The "plain kernel" build has `-DLRSNASH_NO_AVX2`. Times are in
+µs per game; the percentages are against `18834e9`:
+
+| case | before | plain kernel | AVX2 (default) |
+|---|---|---|---|
+| 2x2 LH int64 | 0.133 | **+2.4%** | **+6.3%** |
+| 4x4 / 6x6 LP int64 | 0.307 / 0.754 | **+2.4% / +1.2%** | **+4.8% / +1.9%** |
+| 9x9 LP int64 | 1.90 | **+4.5%** | -8.5% |
+| 9x9 LP auto | 1.95 | **+2.8%** | -9.3% |
+| 15x15 LP auto | 11.77 | -6.1% | -13.8% |
+| 15x15 LP int128 | 16.46 | -13.0% | -12.4% |
+| 4x4 / 9x9 LH int64 | 0.458 / 2.93 | -7.0% / -22.3% | -2.6% / -29.7% |
+| 15x15 LH auto | 11.64 | -30.8% | -44.5% |
+| 15x15 LH int128 | 25.45 | -42.7% | -42.6% |
+| 9x9 Last int64 | 591.1 | -11.6% | -25.5% |
+| 9x9 Last int128 | 1,162 | -17.3% | -17.5% |
+| 9x9 First int64 | 138.1 | -11.8% | -25.6% |
+| 12x12 Last int128 | 19,394 | -17.7% | -17.5% |
+
+**Remaining partial regression.**
+- Dictionaries with fewer than 8 columns take the plain kernel on every
+  machine. There the final state is 1-6% slower than `18834e9`, which is
+  8-15 ns per game at 2x2 and 4x4.
+- Where only the plain kernel runs (`-DLRSNASH_NO_AVX2`, or a CPU without
+  AVX2), the 9x9 LP is 4.5% slower.
+- Section 10.6 traces most of this to code placement, not to the kernel's
+  code.
+
+Section 10.4 predicted that AVX2's real gain would exceed its
+instruction-count reduction, because callgrind counts each vector
+instruction as one. The timings do not bear that out. The gains roughly
+track the counts, against the plain kernel:
+
+| case | time | instructions |
+|---|---|---|
+| 9x9 LP | -14% | -14% |
+| 9x9 LH | -11% | -14% |
+| 9x9 Last | -16% | -15% |
+| 15x15 LH auto | -21% | -27% |
+
+### 10.1 A regression that was codegen, not code
+
+Timing `fff2737` against the session-5 refactor (`18834e9`, A/B
+interleaved) showed the dictionary-pool fix working: 9x9 Last int64 -6%,
+First -7%. But int128 Last was 6-10% *slower*, although the refactor was
+bit-identical and `arith.hpp` had not changed.
+
+Callgrind showed the kernel doing exactly the same work (the same 4,817,184
+entry updates), but with one more instruction per entry. The disassembly
+explained it:
+
+- GCC had started inlining the rare exact 256-bit row (`pivot_row_exact`)
+  into the kernel. The function doubled in size (541 to 1,130
+  instructions), and the register pressure of the cold path spilled into
+  the hot loop.
+- Both versions reloaded the shift count from the stack on every entry and
+  used the general 128-bit shift (`shrd`, `sar`, `test`, two `cmov`).
+
+The fixes, all bit-identical:
+
+- **Cold paths out of line.** Make both exact rows `noinline, cold`, so
+  inlining choices elsewhere cannot change the hot loop.
+- **Specialize on the shift k.** k = 0 (det odd, about half of all pivots)
+  needs no shift at all. For int128 with 0 < k < 64 the shift is just `shrd`
+  + `sar`. (int64 got the k = 0 case too at first; it was taken out again,
+  see section 10.6.) Getting GCC to emit that took a trick:
+  - inside the `k < 64` branch it knows the range, so it folds `k & 63` to
+    `k`;
+  - it then expands the general shift anyway, because the range is not
+    visible at RTL expansion time;
+  - an empty `asm volatile("" : "+r"(k))` inside the loop hides the range,
+    and the `& 63` survives. Clang emits the short shift without help.
+- **No libm call per pivot.** `ldexp` became `pow2`, which builds the power
+  of two from its bits.
+
+Result: int128 paths -13% to -17% in instructions. The per-entry loop is
+30 instructions for k = 0 and 35 for 0 < k < 64, against 40 before.
+
+### 10.2 Lemke-Howson without the identity columns
+
+Lemke-Howson pivoted full tableaus: 1 + m + n columns per row. But n (or m)
+of those columns belong to basic variables, and in a fraction-free tableau
+such a column is just det times a unit vector. The same polytope as an lrs
+dictionary keeps only the 1 + m cobasic columns.
+
+With `D = -T` on the cobasic columns, the existing lrs pivot kernel
+reproduces the tableau update exactly. Every pivot element is negative
+(`T[r][s] > 0`), so the kernel negates column s, stores -det at (r, s) and
+leaves row r alone, which is exactly the leaving variable's new column.
+
+The lexicographic ratio test compares tableau columns of the initial
+slacks. For a basic slack, that column is read implicitly as det or 0. Each
+comparison is the same exact sign as before, so the path is identical.
+
+This was proved by a new gate against the frozen tableau version: every
+missing label, all four types, identical pivots, exact solutions and
+overflow. The result is half the kernel work at 9x9: LH instructions -35%
+(9x9 int64), -53% (15x15 int128), -46% (15x15 auto). The full-tableau
+pivot then had no users and was deleted.
+
+### 10.3 Branch-light reverse search
+
+The callgrind branch simulator put about 50k mispredicts on a 9x9 Last
+game. Leaving aside the kernel's short-loop exits, which a real predictor
+handles better than the simulator, the biggest data-dependent source was
+the candidate collection of the ratio test:
+`if (negative(entry)) cand[n++] = j`. The sign of a dictionary entry is
+effectively random.
+
+Changes:
+
+- Collect candidates without a branch (`cand[n] = j; n += negative(...)`).
+- For int64/int128, replace upstream's sign shortcuts around `comprod` with
+  `comprod` itself. The shortcuts only skip the product, and give the same
+  sign, because both denominators are negative. Two multiplies cost less
+  than up to four unpredictable branches.
+- Let `resort` return the element's final position. This replaces two linear
+  searches after every pivot.
+
+Simulated mispredicts -18%, conditional branches -8%, instructions -1%.
+
+### 10.4 AVX2 without intrinsics
+
+The instruction counts below are from the first AVX2 version. The dispatch
+later moved to one test at the top of `pivot`, for rows of 8 or more
+entries; CONTEXT.md session 6 has the counts and timings of the final
+version.
+
+Compiled for AVX2, GCC already vectorizes the I64 fast row loop:
+
+- each 64-bit product from three `vpmuludq` (32x32-bit);
+- the arithmetic shift from a logical shift plus the sign;
+- the magnitude bound from `vpcmpgtq`.
+
+That is 28 instructions per 4 entries, against about 13 per entry scalar.
+
+So the AVX2 kernel is the same C++ row loop instantiated a second time
+inside a `target("avx2")` function, chosen per pivot by a flag that each
+I64 object sets from `__builtin_cpu_supports` when it is constructed.
+
+One detail mattered. The loop needed `__restrict` parameters, in a small
+helper function: GCC ignores `__restrict` on block-scope pointers, and
+without it every row paid a runtime aliasing check.
+
+`test_kernel` checks both kernels against GMP, and every gate passes with
+AVX2 on and with `-DLRSNASH_NO_AVX2`.
+
+| instructions per game | `18834e9` | no AVX2 | AVX2 |
+|---|---|---|---|
+| 9x9 LP int64 | 20,082 | -1.2% | -9.4% |
+| 9x9 LH int64 | 33,660 | -33.9% | -38.9% |
+| 15x15 LP auto | 138,735 | -7.6% | -16.2% |
+| 15x15 LH auto | 191,764 | -44.8% | -56.5% |
+| 9x9 Last int64 | 5,500,058 | -1.8% | -11.6% |
+
+The 9x9 gain is limited by the row length. Of each 10-entry row, 8 entries
+go through the vector loop and 2 through the scalar epilogue, and every row
+pays about 12 instructions of setup.
+
+I expected the real speed-up to be larger than the instruction counts
+suggested:
+
+- the scalar loop is bound by its two `imul`s per entry, about 2 cycles on
+  Zen 3;
+- the vector loop needs 1.5 `vpmuludq` per entry, and Zen 3 issues two per
+  cycle.
+
+Timed afterwards, it roughly matches the counts (see the table at the start
+of section 10). The AVX2 default stays on (CONTEXT.md Q8).
+
+### 10.5 A kernel test that is known to catch bugs
+
+All of this rests on the fixed-width kernels being exact. The old gates
+only reached the paths that natural games reach. Before this round, no test
+had produced a k >= 64 pivot for int128, and none had come near the
+fast-path limit.
+
+`tools/test_kernel.cc` checks the kernel contract directly against GMP:
+
+- exact values;
+- overflow if and only if a true result does not fit;
+- a sound bound.
+
+It runs on random Bareiss sequences, and on constructed inputs whose
+results straddle the fast-path limit. With det e = 2^k e', a pivot element
+of +-e*m and pivot-row entries that are multiples of e, every division is
+exact, so any magnitude can be placed exactly where it is wanted.
+
+It was mutation-tested: 6 of 6 injected bugs fail it. These include a fast
+path loosened by a factor of 3.8. The random part of the test alone missed
+that one, which is why the constructed cases exist.
+
+### 10.6 The small-LP regression
+
+The first timing of this round found one regression. The plain int64
+kernel was 4-6.5% slower on constant-sum LPs from 4x4 to 9x9, although it
+executed 1.2% fewer instructions. On AVX2 machines, dictionaries under 8
+columns take that path too.
+
+These are a few percent of sub-microsecond solves, so the investigation
+stopped after three cheap steps (A/B interleaved, best of 5):
+
+1. **Drop the int64 k = 0 specialization.** It saved one `sar` per entry,
+   but it added a second copy of the row loop and an unpredictable branch
+   per pivot: k is 0 for about half of the pivots, in no pattern. Without
+   it, the inner loop is instruction for instruction the one in `18834e9`.
+   - 4x4 went from +6.0% to +3.5%, and 6x6 from +4.6% to +1.4%.
+   - 9x9 did not move (+5.3%, then +5.2%).
+   - The AVX2 path did not change.
+2. **Restore `18834e9`'s scalar kernel verbatim** for the plain path. The
+   function compiled to the same size, to the byte, and 9x9 was still
+   +4.5%. So the rest of the gap is not in the kernel's code.
+3. **Build both with the same code alignment**
+   (`-falign-functions=64 -falign-loops=64`). The gap then closes at 4x4 and
+   6x6 (0.0% and -0.1%) and shrinks to +2.3% at 9x9. Most of what remains
+   is where the code lands in the binary.
+
+Step 1 is kept, since it also removes code. Step 2 is not kept. The table
+at the start of section 10 shows what remains.
+
+One lead is left for later. In the default build, step 2's variant also
+brought 4x4 and 6x6 LPs back level with `18834e9` (-0.5% and -0.1%, one
+run); the kept version was at +4.5% and +1.8% in that run.
+- In that build `pivot` had become a small dispatcher, and GCC inlined the
+  whole plain kernel into its callers.
+- A thin dispatcher in front of the kept kernel might do the same.
+- It was not tried: the gain would be a few ns per game, on games smaller
+  than the usual 9x9 (section 8).
 
 ## Reproducing
 

@@ -71,7 +71,7 @@ static void run(S &s, int rows, int cols, int den, int trials, unsigned seed,
     chk += out.value;
   }
   double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  printf("%dx%d den=%d %-5s trials=%d: %10.2f us/game  overflow=%ld%s chk=%.6f\n",
+  printf("%dx%d den=%d %-5s trials=%d: %10.4f us/game  overflow=%ld%s chk=%.6f\n",
          rows, cols, den, mode.c_str(), trials, 1e6 * sec / trials, ovf,
          ans == "all" ? (" eq/game=" + std::to_string((double)neq / trials)).c_str() : "", chk);
 }

@@ -162,9 +162,9 @@ compiled into four static libraries (`lrslib`=MP, `lrslib64`, `lrslib128`,
 2. **Correctness of the port.** Done: the static per-function diff and the
    differential runs vs the upstream binaries passed (see the results log).
 3. **Correctness of the original.** Done: exact NE checks and support
-   enumeration passed. Still not checked: completeness of the extreme
-   equilibrium set on degenerate games, which needs an independent
-   vertex-pair enumerator.
+   enumeration passed. Completeness of the extreme-equilibrium set on
+   degenerate games is checked too (session 5, `tools/check_complete.py`;
+   see the results log).
 4. **Algorithmic (math) optimizations.** Done for this round:
    - the exact LP for constant-sum games;
    - Lemke-Howson as an opt-in single-equilibrium mode;
@@ -181,10 +181,14 @@ compiled into four static libraries (`lrslib`=MP, `lrslib64`, `lrslib128`,
    - O(m) linearity bookkeeping;
    - lossless precision promotion for the LP.
 
-   Optional next steps (see "Next steps"):
+   Second round (session 6; timed, finished and committed in session 7):
+   - Lemke-Howson on dictionaries;
+   - int128 kernel fixes;
    - a branch-light `lrs_ratio`/`reverse`;
-   - an AVX2 kernel;
-   - a fixed 256/512-bit type.
+   - an AVX2 kernel with runtime dispatch.
+
+   Not done: a fixed 256/512-bit type. More ideas are in PERFORMANCE.md
+   section 8.
 6. **C++ rewrite (next major step).** Turn the header-only port into the only
    implementation, written as idiomatic modern C++ (C++17). It must keep the
    hard constraints: header-only, no globals, reentrant, and all four
@@ -272,8 +276,25 @@ compiled into four static libraries (`lrslib`=MP, `lrslib64`, `lrslib128`,
   - No duplicate equilibria were reported, and no game had zero equilibria.
   - For generic games, the reported set **equals** the set found by support
     enumeration (800 games).
-- **Not checked:** completeness of the extreme-equilibrium set for degenerate
-  games. That needs an independent vertex-pair enumerator.
+- **Completeness on degenerate games (session 5): PASSED.**
+  - Static argument: lrsnash reports (x, y) for each vertex x of P1 (once,
+    by lexmin) and each vertex y of the face F(x) of P2 on which the labels
+    missing at x are tight. A face's vertices are exactly P2's vertices
+    lying in it, so the output is exactly the set of completely labelled
+    vertex pairs, i.e. the extreme equilibria.
+  - The subtle point is degenerate x. Its labels must be read from the
+    point, not from the basis: a basic slack with value 0 is tight. nash.hpp
+    does this, because only basic slacks with a nonzero value become face
+    equations.
+  - Independent check: `tools/check_complete.py` enumerates both polyhedra's
+    vertices by brute force (every (k-1)-subset of constraints, exact
+    `Fraction`s, in Python) and compares the completely labelled pairs with
+    what nash.hpp reports (`tools/dump_eq.cc`, GMP).
+  - Results: 300 games up to 5x5 (190 degenerate, including all-zero
+    games), 824 extreme equilibria; 0 missing, 0 extra, 0 duplicates.
+  - The checker is shown to catch errors: hiding every third reported
+    equilibrium fails 130 of 200 games, and reintroducing the session-5
+    linearity-index bug fails 118 of 200.
 
 ### Static review: code vs. paper (2026-11-23)
 The user has already done extensive testing by running the program, so
@@ -416,7 +437,11 @@ sets, or `exit` replaced by `throw`.
 - The returned (row, col) pair is "last found". Confirm that it is always a
   consistent equilibrium pair. The row strategy is written only when that P1
   vertex produced at least one P2 match, so the pairing looks consistent, but
-  this should be proven.
+  this should be proven. **Proven for the new code (session 5):** nash.hpp
+  calls `on_eq1(x)` right after the `on_eq2(y)` calls of x's face whenever
+  there was at least one, including when an `on_eq2` stopped the search. So
+  `FloatEq` ends on the last pair reported (for First, the first), and
+  `value` comes from that pair's y.
 - `lrs_set_row_constraint` in `lib.cc` is a local replacement for upstream
   `lrs_set_row`/`lrs_set_row_mp`. Its denominator handling is effectively a
   no-op, which is fine for integer input, but it should be checked against
@@ -673,7 +698,54 @@ matters). Every `solve_*` throws `invalid_argument` unless rows, cols >= 1.
   - (c) for `den = 0`, report unscaled payoffs.
 - Recommend (a), because legacy's normalisation assumes `den > 0`.
 
-## Current status / next steps (handoff, 2026-11-23)
+**Q6. Inline (fixed-capacity) storage in the solver** (raised by Claude,
+2026-11-24). Decision 7 asks for lower per-call overhead "(stack storage or
+size bounds)". *Blocks:* the stack-storage half of that item.
+- A reused solver allocates nothing after warm-up.
+- A new solver object per game costs about 2k extra instructions, 10-17% of
+  a 9x9 LP or LH solve (session 6).
+- Options:
+  - (a) keep heap storage and document "reuse one solver per thread", as
+    now;
+  - (b) inline storage for games up to a fixed size (say 16x16), with a
+    heap fallback. The solver object grows by several KB per arithmetic
+    type: about 7 KB for the int64 LP and LH, twice that for int128. Small
+    games then allocate nothing, even on a fresh solver;
+  - (c) the same with the capacity as a template parameter
+    (`SolverT<Cap, Ar...>`).
+- Recommend (a) for now. The planned API already asks for a reusable
+  per-thread solver, and (b)/(c) only help callers that construct one per
+  call. Revisit if downstream does that.
+
+**Q7. How the AVX2 kernel detects the CPU** (decided by Claude, 2026-11-24;
+revisit if it matters).
+- Each I64 object calls `__builtin_cpu_supports("avx2")` when it is
+  constructed. That reads libgcc's (or compiler-rt's) CPU-feature record,
+  which a library constructor fills in before `main` and which never changes
+  afterwards. It is not state of ours.
+- Options:
+  - (a) that, as now: one load per solver construction. If a solver is
+    constructed during static initialization, before the record is filled,
+    it simply uses the plain kernel;
+  - (b) `cpuid` + `xgetbv` directly, with no library state involved. But
+    `cpuid` is slow, microseconds under a VM, and it would run on every
+    construction;
+  - (c) a compile-time choice only, `-mavx2`: excluded by decision 8.
+- Recommend (a).
+
+**Q8. AVX2 kernel on by default before it is timed** (decided by Claude,
+2026-11-24).
+- It is bit-identical (gated) and runtime-detected. Instruction counts drop
+  9-22% beyond the scalar kernel.
+- The scalar loop is bound by its two `imul`s per entry, about 2 cycles; the
+  vector loop needs 1.5 `vpmuludq` per entry, and Zen 3 issues two per
+  cycle.
+- Timed 2026-11-24: against the plain kernel, 9x9 LP -14%, 9x9 LH -11%,
+  15x15 LH -21%, 9x9 Last and First -16%. Keep it on.
+- Still open: whether the 8-column threshold (`kAvx2MinCols`) is right. It
+  was chosen from instruction counts and has not been timed at 7-8 columns.
+
+## Current status / next steps (handoff, updated 2026-11-24)
 **User preferences.**
 - Verify correctness by **static analysis against the paper and upstream
   source**. Randomized differential runs are secondary evidence.
@@ -683,25 +755,41 @@ matters). Every `solve_*` throws `invalid_argument` unless rows, cols >= 1.
 - Benchmark only on mains power with the `performance` power profile
   (`powerprofilesctl get`); otherwise do no timing and keep test trial
   counts low (a few hundred games).
+- Do not time, or run CPU-heavy tests, while the user runs their own
+  benchmarks (2026-11-24). Short single-threaded runs under `nice -n 19`
+  are fine; callgrind instruction counts stand in for timing.
 
 **State.**
-- Sessions 4 and 5 are committed on `rewrite` in the commit after
-  `fff2737`. It is local only, not pushed; the user said "proceed". Later
-  work stays uncommitted until the user asks.
-- All tests pass:
-  - `tools/test_lp.cc`, `tools/test_lh.cc`, `tools/test_api.cc`;
-  - full-sequence equality with legacy for all 4 types;
-  - exact NE checks;
-  - `tools/test_refactor.cc`: bit-identical to the pre-refactor headers.
-- The headers compile cleanly with g++ 15 and clang++ 21 at
-  `-Wall -Wextra`, with and without `-DNDEBUG` (checked by building
-  `tools/bench.cc`, which instantiates every solver path).
+- Everything through session 7 is committed on `rewrite`. The commits are
+  local only, not pushed. Later work stays uncommitted until the user asks.
+  - Sessions 4 and 5 are in `1ae7810` and `18834e9`; the user said
+    "proceed".
+  - Session 6 (the second performance round), the session 5 completeness
+    check and session 7's fixes are in the session 7 commit after
+    `18834e9`. The user approved it ("commit sure", 2026-11-24) and asked
+    for the remaining partial regression to be noted. It is in that commit
+    message and in the session 7 notes.
+- All gates pass on the committed tree (session 7, `gates.sh` scale 10). They
+  ran at `-O2` with asserts and at `-O3 -DNDEBUG`, each with and without
+  `-DLRSNASH_NO_AVX2`:
+  - `tools/test_kernel.cc`: the kernel contract against GMP;
+  - `tools/test_lemke_ref.cc`: Lemke-Howson against the frozen `18834e9`
+    copy;
+  - `tools/test_lp.cc`, `tools/test_lh.cc`: exact NE checks;
+  - `tools/test_api.cc`: full-sequence equality with legacy for all 4 types;
+  - `tools/test_refactor.cc`: bit-identical to the pre-refactor headers;
+  - `tools/check_complete.py`: completeness against brute force.
+- The headers compile without warnings with g++ 15 and clang++ 21 at
+  `-Wall -Wextra`, with and without `-DNDEBUG` and `-DLRSNASH_NO_AVX2`.
+  This is checked by building `tools/bench.cc`, which instantiates every
+  solver path.
 - `lib.h`/CMake still build only the legacy code.
 
 **Header-only code (`src/lrsnash/`).**
 - `arith.hpp`: the four policies `I64`, `I128`, `MP<W=112>` and `GMP`, with
-  the fast kernels (`pivot`, `tableau_pivot`, `pivot_safe`,
-  `magnitude_bound`, `from_i64/i128`).
+  the fast kernels (`pivot`, `pivot_safe`, `magnitude_bound`,
+  `from_i64/i128`). Since session 6 the I64 `pivot` also has an AVX2
+  version, chosen at run time, and `tableau_pivot` is gone.
 - `lrs.hpp`: the lrs core (`Dict` and `Problem`), using the kernels and
   `memcpy` copies. Its header documents the dictionary layout, maps every
   function to upstream, and lists the removed dead code with the reason
@@ -709,7 +797,8 @@ matters). Every `solve_*` throws `invalid_argument` unless rows, cols >= 1.
 - `nash.hpp`: the lrsnash driver with a visitor (First, Last and All). Its
   header explains the two polyhedra and the label numbering.
 - `zerosum.hpp`: the LP, with `promote_from` for the auto chain.
-- `lemke.hpp`: Lemke-Howson.
+- `lemke.hpp`: Lemke-Howson, on lrs dictionaries (cobasic columns only)
+  since session 6.
 - `solve.hpp`: `SolverT<Ar...>` and its aliases. It provides:
   - `solve(const ConstantSumGame*, out, Mode = Any)`: `Any` is the LP, and
     `Last` is exactly legacy `solve_fast`;
@@ -735,14 +824,58 @@ matters). Every `solve_*` throws `invalid_argument` unless rows, cols >= 1.
    `Mode::Any`, and the Lemke-Howson missing-label argument is added.
 2. Done (session 5): idiomatic internals (step 6.4) for `lrs.hpp` and
    `nash.hpp`. `lib.h` stays on legacy meanwhile.
-3. Performance work (decision 7), benchmarked at `-O3 -DNDEBUG`.
-   **Blocked until timing is possible** (mains power and the `performance`
-   profile; the user said not to benchmark in session 5). First measure the
-   session-5 pool fix for Last/First, which was not timed:
-   - per-call overhead of the LP and LH (the defaults);
-   - a branch-light `lrs_ratio`/`reverse` for the fixed-width types (P1
-     reverse search is about half of Last-mode time);
-   - an AVX2 kernel behind a target attribute with runtime dispatch.
+3. Performance work (decision 7), benchmarked at `-O3 -DNDEBUG`. **Done,
+   timed and committed (sessions 6 and 7).** It stops here unless the user
+   asks for more speed: the hot paths are in single-digit-% territory (the
+   9x9 LP takes about 1.75 µs with AVX2).
+   - The pool fix was measured: Last -6%, First -7%.
+   - Per-call overhead of the defaults:
+     - Lemke-Howson now pivots dictionaries instead of full tableaus
+       (-35% instructions at 9x9, -53% at 15x15 int128);
+     - the LP's own setup is only about 8% of its cost;
+     - inline storage for fresh solvers is open question Q6.
+   - Branch-light reverse search: -18% simulated mispredicts in Last mode.
+   - An AVX2 kernel with runtime dispatch (I64), on by default (Q8).
+   - Kernel fixes: the int128 regression from session 5, and the int128
+     shift specializations.
+   - **Final timing (session 7)**, against `18834e9`. The table is in
+     PERFORMANCE.md section 10 and in the session 7 notes.
+     - Faster almost everywhere. In the default (AVX2) build: 9x9 LP
+       -8.5%, 15x15 LP -12% to -14%, LH 9x9 -30% and 15x15 -43% to -45%,
+       Last/First -17% to -26%.
+     - AVX2 is confirmed to win where it runs (Q8).
+     - **Remaining partial regression** (also in the commit message):
+       - Dictionaries with fewer than 8 columns take the plain kernel on
+         every machine, which means LP and LH games up to 6x6. They are
+         1-6% slower, 8-15 ns per game at 2x2 and 4x4.
+       - With only the plain kernel (`-DLRSNASH_NO_AVX2`, or a CPU without
+         AVX2), the 9x9 LP is 4.5% slower.
+       - Most of this is code placement, not the kernel's code (session 7
+         notes).
+     - Optional, for the user to decide: a thin `I64::pivot` dispatcher
+       might recover the small-game part (PERFORMANCE.md 10.6). That is a
+       few ns per game.
+   - The timing commands. Session 7 used `tcmp.sh` in its scratchpad, which
+     does the same:
+
+     ```
+     O=/tmp/old && mkdir -p $O/src/lrsnash && for f in arith lrs nash zerosum lemke solve; do git show 18834e9:src/lrsnash/$f.hpp > $O/src/lrsnash/$f.hpp; done && git show 18834e9:src/lib.h > $O/src/lib.h
+     # the same (current) bench.cc for both header trees: it prints 4 decimals
+     g++ -O3 -DNDEBUG -std=c++17 -I$O/src tools/bench.cc -lgmp -o bench_old
+     g++ -O3 -DNDEBUG -std=c++17 -Isrc tools/bench.cc -lgmp -o bench_new
+     g++ -O3 -DNDEBUG -DLRSNASH_NO_AVX2 -std=c++17 -Isrc tools/bench.cc -lgmp -o bench_noavx2
+     # per case, alternate the three binaries 5 times on one idle core, keep the best:
+     for r in 1 2 3 4 5; do for b in bench_old bench_noavx2 bench_new; do taskset -c 4 ./$b 9 9 80 100000 100000001 cs-any i64; done; done
+     ```
+     Cases (rows cols den trials seed mode type):
+     - `4 4 80 300000 . cs-any i64`, `6 6 80 200000 . cs-any i64`,
+       `9 9 80 100000 . cs-any i64|auto` and
+       `15 15 100 20000 . cs-any auto|i128`;
+     - `2 2 80 1000000 . gs-any i64`, `4 4 80 300000 . gs-any i64`,
+       `9 9 80 60000 . gs-any i64|auto` and
+       `15 15 100 20000 . gs-any auto|i128`;
+     - `9 9 80 400 . gs-last i64`, `9 9 80 300 . gs-last i128`,
+       `9 9 80 2000 . gs-first i64`, and `12 12 100 15 . gs-last i128`.
 4. API extras: exact rational output of `extreme_equilibria`, rational
    payoff input.
    **Blocked on the interface questions Q2 and Q3.**
@@ -845,10 +978,310 @@ matters). Every `solve_*` throws `invalid_argument` unless rows, cols >= 1.
     comparable.
   - All gates passed at low counts (`test_lp` 300, `test_lh` 150, `test_api`
     200, `test_refactor` 300 games): 0 mismatches.
-- Work-plan step 3 gap: the completeness check for degenerate games is
-  written: `tools/dump_eq.cc` and `tools/check_complete.py` (brute-force
-  vertex pairs in exact rationals). They are in the working tree, not
-  committed. Results are below once it has run.
+- Work-plan step 3 gap closed: completeness on degenerate games PASSED
+  (300 games, 190 degenerate, 0 mismatches; details in the results log).
+  `tools/dump_eq.cc` and `tools/check_complete.py` are in the working tree,
+  **not committed**.
+
+**Progress (2026-11-24, session 6): performance work, next step 3.**
+- **Timing.** The machine was on mains with the `performance` profile, but
+  the user was running their own benchmarks: "refrain from tests that hog
+  cpu". After the first native measurements below, the evidence is callgrind
+  instruction counts (deterministic, single core, under `nice`) plus a static
+  reading of the generated code. Later the user allowed full CPU use, and
+  the final state was timed: see "Wall-clock results" at the end of this
+  section, including **a known partial regression**.
+- **First native measurements.** These were taken under background load,
+  A/B interleaved, pinned to CPU 4, best of 5. Only the ratios are
+  meaningful.
+  - The session-5 pool fix (`fff2737` vs `18834e9`): 9x9 Last int64 672 ->
+    634 µs (-6%), First 158 -> 148 µs (-7%).
+  - **Regression:** int128 Last was 6-10% slower after the session-5
+    refactor (9x9: 1,118 -> 1,185 µs; another round 1,200 -> 1,319 µs) and
+    5% slower at 12x12, although `arith.hpp` did not change.
+    - Cause: GCC inlined the rare exact 256-bit row (`pivot_row_exact`) into
+      the kernel. The kernel grew from 541 to 1,130 instructions, and the hot
+      loop gained an instruction per entry.
+    - Fixed below.
+  - The defaults, current code:
+    - 9x9 LP: 2.05 µs (int64), 2.09 µs (auto);
+    - 9x9 LH: 3.14 µs (int64), 3.21 µs (auto);
+    - 15x15 LP: 12.55 µs (auto), 17.6 µs (int128);
+    - 15x15 LH: 12.63 µs (auto), 28.35 µs (int128).
+- **Kernel changes (`arith.hpp`).** All are bit-identical.
+  - The rare exact rows (I64 `exact_row`, I128 `pivot_row_exact`) are
+    `noinline, cold`, so they cannot take registers from the fast loop.
+  - The row loop is specialized on the shift k:
+    - k = 0 (det odd, about half of all pivots) needs no shift. Session 7
+      removed this case again for I64 (see its notes);
+    - for I128 with 0 < k < 64, the shift is `shrd` + `sar` instead of the
+      general 128-bit shift (`test` + two `cmov`). GCC folds `k & 63` away
+      when it knows k < 64 and then expands the general shift, so an empty
+      `asm volatile` inside the loop hides k's range from it.
+  - `ldexp`, a libm call on every I128 pivot, is replaced by `pow2`, an exact
+    power of two built from its bits.
+  - `tableau_pivot`, `dense_tableau_pivot` and the `LRS` template parameter
+    are removed. They became dead once Lemke-Howson moved to `pivot`.
+- **Lemke-Howson on dictionaries (`lemke.hpp`).**
+  - Each polytope keeps only its cobasic columns, as an lrs dictionary,
+    instead of the full tableau. The basic columns of a tableau are just det
+    times unit vectors.
+  - The lrs `pivot` kernel performs exactly the tableau update on the stored
+    columns, because the pivot element is always negative here.
+  - The lexicographic ratio test reads the tableau entries of the initial
+    slacks from the dictionary: det or 0 for a basic slack.
+  - The path and the result are the same. Kernel work per pivot drops from
+    rows x (1+m+n) to rows x (1+m).
+- **Instructions per game** (callgrind, `-O3 -DNDEBUG`, `18834e9` -> now):
+
+  | case | before | now | change |
+  |---|---|---|---|
+  | 9x9 LP int64 | 20,300 | 19,539 | -3.7% |
+  | 9x9 LP auto | 20,963 | 20,440 | -2.5% |
+  | 9x9 LH int64 | 33,677 | 21,905 | -35.0% |
+  | 15x15 LP auto | 141,358 | 125,777 | -11.0% |
+  | 15x15 LP int128 | 210,053 | 175,114 | -16.6% |
+  | 15x15 LH int128 | 436,459 | 204,642 | -53.1% |
+  | 15x15 LH auto | 191,985 | 104,350 | -45.6% |
+  | 9x9 Last int64 | 5,491,724 | 5,377,756 | -2.1% |
+  | 9x9 Last int128 | 12,559,023 | 10,544,218 | -16.0% |
+  | 9x9 First int64 | 1,195,589 | 1,173,981 | -1.8% |
+
+- **Where the 9x9 LP's instructions go now.**
+  - The kernel is 71%: an inner loop of 13.2 instructions per entry (~70%
+    of the kernel), about 15 instructions per row and about 150 per pivot.
+  - Pivot selection and ratio tests are 11%, setup 8%, float output 1.4%.
+  - Unrolling or hoisting per-row work might save about 15% of kernel
+    instructions. Whether that saves time depends on whether the loop is
+    already bound by its two `imul`s per entry, so it needs wall-clock
+    timing.
+- **A fresh solver per game costs about 2k instructions more** (10-17% of a
+  9x9 LP or LH solve): construction, `malloc`/`free` of about 20 vectors,
+  and the destructor. A reused solver allocates nothing. See Q6.
+- **New gates.**
+  - `tools/test_kernel.cc` checks the kernel contract against GMP:
+    - exact values;
+    - overflow thrown if and only if a true result does not fit;
+    - a sound returned bound.
+
+    It runs on random Bareiss pivot sequences, and on constructed inputs
+    whose results straddle the fast-path limit, for k = 0, 0 < k < 64 and
+    k >= 64.
+    - Mutation-checked: 6 of 6 injected kernel bugs fail it (a wrong shift
+      for k >= 64, a missing bound accumulation, a loosened fast-path limit
+      for I64 and for I128, a loosened all-rows test, a missing I128
+      overflow check).
+    - The first version missed the loosened limit, because random
+      dictionaries almost never reach it; the constructed boundary cases were
+      added for that.
+  - `tools/test_lemke_ref.cc` compares Lemke-Howson with the frozen
+    `18834e9` `lemke.hpp`, for every missing label and all 4 types: same
+    pivots, exact solution, floats and overflow.
+  - `test_lh`'s reference now overrides `pivot` (it was `tableau_pivot`).
+  - All gates pass at `-O2` and at `-O3 -DNDEBUG`.
+- **Branch-light reverse search (`lrs.hpp`).** All of these are
+  bit-identical; `test_refactor` passed on 600 games up to 12x12 (233k
+  pivots, all 4 types).
+  - `ratio_test` collects its candidates without a branch:
+    `cand[n] = j; n += negative(...)`.
+  - For the fixed-width types (the new `Ar::fixed_width` constant),
+    `ratio_test` and `is_reverse_pivot` compare with `comprod` directly.
+    They no longer use upstream's sign shortcuts, which only avoid the
+    product and give its sign: checked case by case, since both
+    denominators are negative. `is_reverse_pivot` combines its test without
+    short-circuit branches. lrsmp and GMP keep the shortcuts, because their
+    products are expensive.
+  - `resort` returns the element's new place. This replaces the two linear
+    searches after every pivot; the lists are sorted and distinct, so the
+    position is the same.
+  - Measured on 9x9 int64 Last with callgrind's branch simulator:
+    instructions -1.0%, conditional branches -7.8%, simulated mispredicts
+    -17.9% (49.6k -> 40.7k per game).
+  - The biggest remaining source (18k per game) is the kernel's inner-loop
+    exit on 10-entry rows. Zen 3's predictor probably handles that better
+    than the simulator does.
+- **AVX2 kernel (I64, `arith.hpp`).**
+  - `rows_pass_avx2` is the same row loop compiled with
+    `__attribute__((target("avx2")))`. GCC and Clang vectorize it: 6
+    `vpmuludq` per 4 entries for the two 64-bit products, and the
+    arithmetic shift from a logical shift plus the sign. That is 7
+    instructions per entry against 13-14 for the scalar loop.
+  - The fast loop is a separate function `fast_row` with `__restrict`
+    parameters. Without them GCC adds a runtime aliasing check to every row,
+    and it ignores `__restrict` on block-scope pointers.
+  - Dispatch: each I64 object sets `avx2 = __builtin_cpu_supports("avx2")`
+    when it is constructed (Q7), and `pivot()` branches on that flag.
+    `-DLRSNASH_NO_AVX2` compiles the AVX2 version out.
+  - `test_kernel` runs the I64 contract with both kernels. All gates pass
+    with AVX2 on and with `-DLRSNASH_NO_AVX2`, and the kernel, LH and
+    refactor gates also pass under clang `-O3`.
+  - Wall-clock speed is **not measured** (Q8).
+  - Instructions per game with AVX2, against `18834e9` and against the same
+    code with `-DLRSNASH_NO_AVX2` (callgrind, `-O3 -DNDEBUG`):
+
+    | case | `18834e9` | no AVX2 | AVX2 |
+    |---|---|---|---|
+    | 9x9 LP int64 | 20,082 | -1.2% | -9.4% |
+    | 9x9 LH int64 | 33,660 | -33.9% | -38.9% |
+    | 15x15 LP auto | 138,735 | -7.6% | -16.2% |
+    | 15x15 LH auto | 191,764 | -44.8% | -56.5% |
+    | 9x9 Last int64 | 5,500,058 | -1.8% | -11.6% |
+    | 9x9 First int64 | 1,197,914 | -1.6% | -11.3% |
+
+    The `18834e9` column differs by 1-3% from the first table because the
+    profiling driver changed in between. Compare within one table only.
+  - On 9x9 the vector loop covers 8 of each row's 10 entries; the other 2
+    take the scalar epilogue, and each row pays about 12 instructions of
+    vector setup.
+  - 15x15 LP int64 shows +2.2% without AVX2. Most of those games overflow,
+    and the out-of-line `exact_row` adds a frame for every throw to unwind
+    (the unwinder is 26% of that case). This is the error path, not the
+    kernel.
+- **Later changes from the small-game check (before committing):**
+  - The first AVX2 version made small games slower in instruction count:
+    LP +7.8% at 2x2, falling to +1.4% at 6x6. The dictionary LH was +14.5%
+    at 2x2. Three changes followed:
+  - **AVX2 dispatch** is now one test at the top of `I64::pivot`:
+    `if (avx2 && cols >= kAvx2MinCols) pivot_avx2(...)`.
+    - `pivot_avx2` is the whole `pivot_impl` compiled for AVX2, so the
+      AVX2 path costs no extra call, and the per-pivot loops vectorize too.
+    - `kAvx2MinCols = 8`, chosen from instruction counts: shorter rows get
+      at most one vector iteration.
+    - `rows_pass_avx2` is gone. `test_kernel`'s boundary cases now go up to
+      13 columns, so they reach the AVX2 path.
+  - **`lemke.hpp` setup:** `col`/`row` use `resize` instead of `assign`
+    (every label is written by `basic`/`cobasic`). Both sides start with an
+    unknown bound, as `18834e9` did, instead of a `magnitude_bound` pass.
+    **This last edit has not been gated yet.**
+  - Instruction counts after these changes (`18834e9` -> no AVX2 / AVX2):
+
+    | case | no AVX2 | AVX2 |
+    |---|---|---|
+    | LP 2x2 / 4x4 / 6x6 int64 | -1.4% / -1.3% / -1.2% | -0.6% each |
+    | LP 9x9 int64 | -1.2% | -14.8% |
+    | LP 15x15 auto | -7.6% | -18.1% |
+    | LH 2x2 / 4x4 / 9x9 int64 | -4.5% / -19.3% / -34.8% | -3.6% / -19.0% / -44.1% |
+    | LH 15x15 auto | -44.9% | -60.0% |
+    | Last 6x6 / 9x9 int64 | -1.8% / -1.8% | -12.2% / -16.3% |
+    | First 9x9 int64 | -1.6% | -16.1% |
+    | Last 9x9 int128 | -13.4% | -13.4% |
+    | Last 4x4 GMP | -0.2% | -0.2% |
+    | LP 15x15 int64 (mostly overflow) | +2.2% | -18.8% |
+
+- **Wall-clock results** (2026-11-24, after the user allowed full CPU use).
+  - Setup: mains, `performance` profile, light load, `-O3 -DNDEBUG`, pinned
+    to CPU 4.
+  - The three builds alternated, best of 5, µs per game: `18834e9` (head),
+    the working tree with `-DLRSNASH_NO_AVX2`, and the working tree.
+  - `lemke.hpp` was already in its final state for this run.
+
+  | case | head | no AVX2 | vs head | AVX2 | vs head |
+  |---|---|---|---|---|---|
+  | 4x4 LP int64 | 0.31 | 0.33 | **+6.5%** | 0.33 | **+6.5%** |
+  | 6x6 LP int64 | 0.77 | 0.80 | **+3.9%** | 0.80 | **+3.9%** |
+  | 9x9 LP int64 | 1.97 | 2.06 | **+4.6%** | 1.78 | -9.6% |
+  | 9x9 LP auto | 1.98 | 2.07 | **+4.5%** | 1.80 | -9.1% |
+  | 15x15 LP auto | 11.95 | 11.34 | -5.1% | 10.29 | -13.9% |
+  | 15x15 LP int128 | 17.08 | 14.91 | -12.7% | 14.88 | -12.9% |
+  | 2x2 LH int64 | 0.14 | 0.14 | 0 | 0.15 | **+7.1%** (at the timer's 0.01 µs resolution) |
+  | 4x4 LH int64 | 0.48 | 0.45 | -6.2% | 0.45 | -6.2% |
+  | 9x9 LH int64 | 3.02 | 2.37 | -21.5% | 2.11 | -30.1% |
+  | 9x9 LH auto | 3.06 | 2.37 | -22.5% | 2.08 | -32.0% |
+  | 15x15 LH auto | 12.08 | 8.37 | -30.7% | 6.64 | -45.0% |
+  | 15x15 LH int128 | 26.51 | 15.17 | -42.8% | 15.16 | -42.8% |
+  | 9x9 Last int64 | 610.9 | 546.9 | -10.5% | 458.6 | -24.9% |
+  | 9x9 Last int128 | 1,208 | 996.6 | -17.5% | 1,001 | -17.1% |
+  | 9x9 First int64 | 141.6 | 127.6 | -9.8% | 106.6 | -24.7% |
+  | 12x12 Last int128 | 19,736 | 16,238 | -17.7% | 16,274 | -17.5% |
+
+  - **AVX2 (Q8) is confirmed** where it runs. Against the plain kernel:
+    9x9 LP -14% (1.78 vs 2.06 µs), 9x9 LH -11%, 15x15 LH -21%, 9x9 Last and
+    First -16%. Keep it on.
+  - **Known partial regression** (as session 6 left it; session 7 fixed
+    part of it and traced most of the rest to code placement, see its
+    notes): the plain int64 kernel is
+    4-6.5% slower on constant-sum LPs at 4x4-9x9, although it executes 1.2%
+    *fewer* instructions.
+    - On AVX2 machines, games with 8 or more columns (LP 7x7 and up) use the
+      AVX2 kernel and are faster.
+    - Smaller LPs take the plain path on every machine and are 4-6.5%
+      slower. LH, Last, First and all int128 paths are faster despite it.
+  - Hypotheses, to check by bisecting. Time 4x4/6x6/9x9 cs-any with
+    `-DLRSNASH_NO_AVX2` against variants of `arith.hpp`:
+    1. The I64 `k == 0` specialization. It saves only one `sar` per entry,
+       but adds a data-dependent branch per pivot (k is 0 about half the
+       time, in no pattern) plus a second copy of the row loop. For I128 it
+       saves 5 instructions per entry, so keep it there. Likely the main
+       cause.
+    2. The `Step` struct passed by reference, if not fully scalarized: 13
+       stores and reloads per pivot.
+    3. The `fast_row` helper or the out-of-line `exact_row` changing layout
+       or registers in the row loop.
+    4. Code alignment.
+
+    Fix whatever is found, re-time, and if anything is still slower, record
+    it here and in the commit message (user's request). Session 7 did
+    this: hypothesis 1 was part of it, and most of the rest is
+    hypothesis 4.
+  - `tools/bench.cc` printed µs with 2 decimals, too coarse for 2x2 (0.14
+    µs). Since session 7 it prints 4.
+
+**Progress (2026-11-24, session 7): the regression, then the commit.**
+- The final `lemke.hpp` edit is gated. All gates pass at `gates.sh` scale
+  10 in four configurations: `-O2` with asserts and `-O3 -DNDEBUG`, each
+  with and without `-DLRSNASH_NO_AVX2`.
+- **The small-LP regression** (session 6 "Wall-clock results"). It was
+  investigated A/B interleaved, best of 5, against `18834e9`, and stopped
+  after three cheap steps, given the user's cost concern:
+  1. **Drop the I64 `k == 0` specialization.** Kept.
+     - Plain kernel: 4x4 +6.0% -> +3.5%, 6x6 +4.6% -> +1.4%, 9x9 +5.3% ->
+       +5.2%.
+     - The AVX2 path did not change.
+     - The scalar inner loop is now instruction for instruction the one in
+       `18834e9`.
+  2. **Restore `18834e9`'s scalar kernel verbatim** for the plain path.
+     The function compiled to the same size, to the byte, and 9x9 was still
+     +4.5%. Not kept.
+  3. **Build both with `-falign-functions=64 -falign-loops=64`.** 4x4 then
+     shows 0.0%, 6x6 -0.1% and 9x9 +2.3%. Most of the gap is code
+     placement.
+  - `perf` cannot be used (`perf_event_paranoid` = 4), so there are no
+    counter data.
+- **Clang warnings fixed.** Clang 21 gave 6 `-Wbitwise-instead-of-logical`
+  warnings on session 6's branch-free `is_reverse_pivot`. Each predicate
+  now goes into a named `bool` first. GCC's code changed only in register
+  allocation in `next_basis`, and Last/First timing moved by -0.2% to -1.2%,
+  which is noise.
+- **Final timing** (µs per game; percentages against `18834e9`; "plain" =
+  `-DLRSNASH_NO_AVX2`):
+
+  | case | `18834e9` | plain | AVX2 (default) |
+  |---|---|---|---|
+  | 4x4 LP int64 | 0.3068 | **+2.4%** | **+4.8%** |
+  | 6x6 LP int64 | 0.7538 | **+1.2%** | **+1.9%** |
+  | 9x9 LP int64 | 1.9041 | **+4.5%** | -8.5% |
+  | 9x9 LP auto | 1.9493 | **+2.8%** | -9.3% |
+  | 15x15 LP auto | 11.77 | -6.1% | -13.8% |
+  | 15x15 LP int128 | 16.46 | -13.0% | -12.4% |
+  | 2x2 LH int64 | 0.1331 | **+2.4%** | **+6.3%** |
+  | 4x4 LH int64 | 0.4579 | -7.0% | -2.6% |
+  | 9x9 LH int64 | 2.927 | -22.3% | -29.7% |
+  | 9x9 LH auto | 2.997 | -24.6% | -32.2% |
+  | 15x15 LH auto | 11.64 | -30.8% | -44.5% |
+  | 15x15 LH int128 | 25.45 | -42.7% | -42.6% |
+  | 9x9 Last int64 | 591.1 | -11.6% | -25.5% |
+  | 9x9 Last int128 | 1,162 | -17.3% | -17.5% |
+  | 9x9 First int64 | 138.1 | -11.8% | -25.6% |
+  | 12x12 Last int128 | 19,394 | -17.7% | -17.5% |
+
+  Run-to-run noise is about 1-2%.
+  - In the default build, games under 8 dictionary columns use the plain
+    kernel too, yet they are slower there than in the plain build (4x4 LP
+    +4.8% against +2.4%). Only the code around the kernel differs.
+  - A lead that was not followed: in step 2's variant, `pivot` had become a
+    small dispatcher, and GCC inlined the plain kernel into its callers. In
+    the default build that variant had 4x4 and 6x6 LPs level with
+    `18834e9` (-0.5% and -0.1%, one run). See PERFORMANCE.md 10.6.
 
 Not planned: a fixed 256/512-bit type (only helps at 30x30 and larger; it
 is the item to revisit if 50x50 matters).
@@ -865,8 +1298,17 @@ python3 tools/instrument_legacy.py /tmp/legacy && (cd /tmp/legacy && for f in li
 g++ -O2 -std=c++17 -Isrc tools/test_api.cc /tmp/legacy/*.o -lgmp -o test_api && ./test_api 1000 8 1
 mkdir -p /tmp/ref/lrsnash_ref && for f in arith lrs nash; do git show fff2737:src/lrsnash/$f.hpp | sed 's/\bLRSNash\b/LRSNashRef/g' > /tmp/ref/lrsnash_ref/$f.hpp; done
 g++ -O2 -std=c++17 -Isrc -I/tmp/ref tools/test_refactor.cc -lgmp -o test_refactor && ./test_refactor 3000 9 1
+g++ -O2 -std=c++17 -Isrc tools/dump_eq.cc -lgmp -o dump_eq && python3 -I tools/check_complete.py ./dump_eq 200 4 1
+g++ -O2 -std=c++17 -Isrc tools/test_kernel.cc -lgmp -o test_kernel && ./test_kernel 3000 1
+git show 18834e9:src/lrsnash/lemke.hpp | sed 's/\bLRSNash\b/LRSNashRef/g' > /tmp/ref/lrsnash_ref/lemke.hpp
+g++ -O2 -std=c++17 -Isrc -I/tmp/ref tools/test_lemke_ref.cc -lgmp -o test_lemke_ref && ./test_lemke_ref 400 12 1
 g++ -O2 -std=c++17 -Isrc tools/bench.cc -lgmp -o bench && ./bench 9 9 80 10000 100000001 cs-any auto
 ```
+Run the gates once more with `-DLRSNASH_NO_AVX2` added to every build, so
+that the plain I64 kernel is covered too on an AVX2 machine. Session 6 used
+a script that does all of the above under `nice -n 19` and greps for nonzero
+counts (`gates.sh` in its scratchpad; recreate it from these lines if it is
+gone).
 Every mismatch count should be 0. The exception is the
 `fast_test`-style comparison of `solve_fast` against the legacy *value*: it
 shows rare mismatches on 9x9 games with payoffs 0..1000. Those are the legacy
@@ -882,10 +1324,28 @@ shows rare mismatches on 9x9 games with payoffs 0..1000. Those are the legacy
   Lemke-Howson (kernel bit-identity, exact NE checks in GMP).
 - `test_api.cc` + `instrument_legacy.py`: solve.hpp vs the legacy library,
   checking full output sequences for all 4 types.
+- `dump_eq.cc` + `check_complete.py`: completeness of the extreme
+  equilibria against an independent brute-force vertex-pair enumeration in
+  exact rationals, run as
+  `python3 -I tools/check_complete.py ./dump_eq trials maxdim seed`.
+  Keep maxdim at 5 or less: the brute force tries every (k-1)-subset of the
+  constraints.
 - `test_refactor.cc`: `nash.hpp`/`lrs.hpp` vs the frozen pre-refactor
   headers (`fff2737`). It checks exact events, pivots, early stop and
   overflow, and that a repeat solve allocates nothing. Use it as the gate
   for any further internal change.
+- `test_kernel.cc`: the contract of the fixed-width pivot kernels (I64
+  plain and AVX2, I128) against GMP:
+  - exact values;
+  - overflow if and only if a true result does not fit;
+  - a sound returned bound.
+
+  It uses random Bareiss pivot sequences and constructed inputs at the
+  fast-path limit. Run it for any kernel change. Mutation-checked in
+  session 6.
+- `test_lemke_ref.cc`: Lemke-Howson vs a frozen copy (`18834e9`, namespace
+  `LRSNashRef`), every missing label, all 4 types. Use it as the gate for
+  any change to `lemke.hpp`.
 - Older tools (copies; the originals are in the session scratchpad):
 - `extract.py`: per-function normalized diff, run as
   `python3 extract.py upstream.c stripped.cc outdir`.

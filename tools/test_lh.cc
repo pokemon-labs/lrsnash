@@ -1,6 +1,6 @@
 // Exactness tests for Lemke-Howson (src/lrsnash/lemke.hpp), for every
-// missing label k0: fast tableau kernels bit-identical to the reference and
-// across I64/I128/lrsmp/GMP; every result an exact Nash equilibrium with
+// missing label k0: fast pivot kernels bit-identical to the reference lrs
+// pivot (dense_pivot) and across I64/I128/lrsmp/GMP; every result an exact Nash equilibrium with
 // exactly the reported payoffs (GMP rational check). Also checks the public
 // API: solve(GeneralSumGame*, Mode::Any, label) runs Lemke-Howson with
 // missing label label + 1 and rejects labels outside [0, rows + cols); every
@@ -14,9 +14,10 @@
 #include <random>
 #include <string>
 using namespace LRSNash; using namespace LRSNash::arith;
-template <class Base> struct RefTab : Base {
-  void tableau_pivot(typename Base::T *A, long st, long rows, long cols, long r, long s, typename Base::T &det, std::uint64_t &) {
-    dense_tableau_pivot(static_cast<Base &>(*this), A, st, rows, cols, r, s, det);
+// Lemke-Howson with the reference lrs pivot instead of the fast kernel
+template <class Base> struct RefPivot : Base {
+  void pivot(typename Base::T *A, long st, long rows, long cols, long r, long s, typename Base::T &det, std::uint64_t &) {
+    dense_pivot(static_cast<Base &>(*this), A, st, rows, cols, r, s, det);
   }
 };
 static void to_mpz(mpz_t z, const int64_t &a) { mpz_set_si(z, a); }
@@ -124,9 +125,9 @@ int main(int argc, char **argv) {
     if (!api_rejects(m, n, A, B)) ++bad_api;
     for (long k0 = 1; k0 <= m + n; k0++) {
       if (!api_same(m, n, A, B, k0)) ++bad_api;
-      Ex g = run<GMP>(m, n, A, B, k0), gr = run<RefTab<GMP>>(m, n, A, B, k0);
-      Ex a = run<I64>(m, n, A, B, k0), ar = run<RefTab<I64>>(m, n, A, B, k0);
-      Ex b = run<I128>(m, n, A, B, k0), br = run<RefTab<I128>>(m, n, A, B, k0);
+      Ex g = run<GMP>(m, n, A, B, k0), gr = run<RefPivot<GMP>>(m, n, A, B, k0);
+      Ex a = run<I64>(m, n, A, B, k0), ar = run<RefPivot<I64>>(m, n, A, B, k0);
+      Ex b = run<I128>(m, n, A, B, k0), br = run<RefPivot<I128>>(m, n, A, B, k0);
       Ex c = run<MP<>>(m, n, A, B, k0);
       if (!same(c, g)) ++bad_k;
       if (!same(g, gr)) ++bad_k;

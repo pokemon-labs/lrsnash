@@ -7,6 +7,9 @@
 // no global or thread_local state. A policy exposes:
 //
 //   using T;                       storage type of one integer
+//   fixed_width                    true for I64/I128: operations are a few
+//                                  instructions and comprod never throws, so
+//                                  callers may prefer arithmetic to branches
 //   set(T&, long)                  a = v                      (itomp)
 //   copy(T&, const T&)             a = b
 //   zero/positive/negative/one     predicates
@@ -61,6 +64,13 @@
 #define LRSNASH_HAVE_GMP 1
 #endif
 
+// The I64 pivot kernel has an AVX2 version on x86, chosen at run time by
+// each I64 object (see I64::avx2). Define LRSNASH_NO_AVX2 to leave it out.
+#if !defined(LRSNASH_NO_AVX2) && (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__))
+#define LRSNASH_AVX2 1
+#endif
+
 namespace LRSNash {
 
 struct overflow_error : std::overflow_error {
@@ -95,23 +105,12 @@ inline unsigned ctz128(unsigned __int128 a) {
 inline double u128_to_double(unsigned __int128 a) {
   return (double)(std::uint64_t)(a >> 64) * 0x1p64 + (double)(std::uint64_t)a;
 }
-
-// Reference full-tableau pivot (see I64::tableau_pivot). Requires Ars > 0.
-template <class Ar>
-void dense_tableau_pivot(Ar &ar, typename Ar::T *A, long stride, long rows,
-                         long cols, long r, long s, typename Ar::T &det) {
-  using T = typename Ar::T;
-  T *Arow = A + r * stride;
-  T Ars;
-  ar.copy(Ars, Arow[s]);
-  for (long i = 0; i < rows; i++) {
-    if (i == r) continue;
-    T *Ai = A + i * stride;
-    for (long j = 0; j < cols; j++)
-      if (j != s) ar.qpiv(Ai[j], Ars, Ai[s], Arow[j], det);
-    ar.set(Ai[s], 0);
-  }
-  ar.copy(det, Ars);
+// 2^x exactly, for -1022 <= x <= 1023 (no libm call, unlike ldexp)
+inline double pow2(int x) {
+  const std::uint64_t bits = (std::uint64_t)(x + 1023) << 52;
+  double d;
+  std::memcpy(&d, &bits, sizeof d);
+  return d;
 }
 
 // Reference implementation of the lrs integer pivot (upstream pivot(),
@@ -153,6 +152,7 @@ void dense_pivot(Ar &ar, typename Ar::T *A, long stride, long rows, long cols,
 struct I64 {
   using T = std::int64_t;
   static constexpr const char *name = "int64";
+  static constexpr bool fixed_width = true;
 
   static void set(T &a, long v) { a = v; }
   static void copy(T &a, const T &b) { a = b; }
@@ -219,10 +219,6 @@ struct I64 {
   // maximum, and rows that fail use exact 128-bit arithmetic. The new bound is
   // accumulated in the main loop.
   static std::uint64_t mag(T a) { return (std::uint64_t)(a ^ (a >> 63)); }
-  void pivot(T *A, long stride, long rows, long cols, long r, long s, T &det,
-             std::uint64_t &bound) {
-    pivot_core<true>(A, stride, rows, cols, r, s, det, bound);
-  }
   // `bound` for a dense block (OR of mag over all entries)
   static std::uint64_t magnitude_bound(const T *A, long stride, long rows,
                                        long cols) {
@@ -246,27 +242,38 @@ struct I64 {
            (double)e * (double)(1ULL << (62 - k));
   }
   static void from_i64(T &a, std::int64_t v) { a = v; }
-  // Full-tableau (Edmonds/Bareiss) pivot, used by Lemke-Howson: for i != r,
-  // A[i][j] = (A[i][j]*Ars - A[i][s]*A[r][j]) / det for all j (so column s
-  // becomes 0), row r unchanged, det = Ars. Requires Ars > 0.
-  void tableau_pivot(T *A, long stride, long rows, long cols, long r, long s,
-                     T &det, std::uint64_t &bound) {
-    pivot_core<false>(A, stride, rows, cols, r, s, det, bound);
+  void pivot(T *A, long stride, long rows, long cols, long r, long s, T &det,
+             std::uint64_t &bound) {
+#ifdef LRSNASH_AVX2
+    if (avx2 && cols >= kAvx2MinCols) {
+      pivot_avx2(A, stride, rows, cols, r, s, det, bound);
+      return;
+    }
+#endif
+    pivot_impl(A, stride, rows, cols, r, s, det, bound);
   }
-  template <bool LRS>
-  void pivot_core(T *A, long stride, long rows, long cols, long r, long s,
-                  T &det, std::uint64_t &bound) {
+
+#ifdef LRSNASH_AVX2
+  // Use the AVX2 kernel: set if the CPU has AVX2. The results are the same
+  // bit for bit either way (tests clear it to check the plain kernel).
+  bool avx2 = __builtin_cpu_supports("avx2");
+  // Shorter rows get at most one vector iteration plus a scalar tail, and
+  // the plain kernel does less work there (instruction counts, session 6).
+  static constexpr long kAvx2MinCols = 8;
+#endif
+
+ private:
+  __attribute__((always_inline)) void pivot_impl(T *A, long stride, long rows, long cols,
+                                                 long r, long s, T &det,
+                                                 std::uint64_t &bound) {
     using u64 = std::uint64_t;
-    using i128 = __int128;
-    using u128 = unsigned __int128;
     T *Arow = A + r * stride;
     const T ars = Arow[s];
     const bool neg = ars < 0;
     const u64 aars = neg ? (u64)0 - (u64)ars : (u64)ars;
     const u64 e = (u64)det;
-    const unsigned k = __builtin_ctzll(e);
+    const unsigned k = __builtin_ctzll(e);  // <= 62, as det <= MAX
     const u64 inv = inv64(e >> k);
-    const u64 R = aars * inv;
     if ((long)C.size() < cols) C.resize(cols);
     u64 *Cj = C.data();
     u64 Mr = 0;
@@ -274,55 +281,115 @@ struct I64 {
       Cj[j] = (u64)Arow[j] * inv;
       Mr |= mag(Arow[j]);
     }
-    const double lim = (double)e * (double)(1ULL << (62 - k));
-    const double daars = (double)aars, dMr = (double)Mr + 1.0;
+    const Step p{Arow, Cj, cols, s, aars, aars * inv, inv, e, k, neg,
+                 (double)e * (double)(1ULL << (62 - k)), (double)aars,
+                 (double)Mr + 1.0};
     const bool all_fast =
-        bound != ~(u64)0 && ((double)bound + 1.0) * (daars + dMr) <= lim;
+        bound != ~(u64)0 && ((double)bound + 1.0) * (p.daars + p.dMr) <= p.lim;
+    // One row loop for every k. Unlike for I128, a k == 0 special case saves
+    // only one shift per entry; timed, it was no faster at 9x9 and slower on
+    // small games, as its per-pivot branch is unpredictable (k is 0 for
+    // about half of all pivots, in no pattern).
     u64 nb = Mr | e | aars;
-    for (long i = 0; i < rows; i++) {
-      if (i == r) continue;
-      T *Ai = A + i * stride;
-      const T b = Ai[s];
-      const T bs = neg ? -b : b;
-      bool fast = all_fast;
-      if (!fast) {
-        u64 Mi = 0;
-        for (long j = 0; j < cols; j++) Mi |= mag(Ai[j]);
-        fast = ((double)Mi + 1.0) * daars + (double)(bs < 0 ? -bs : bs) * dMr <=
-               lim;
-      }
-      u64 acc = mag(bs);
-      if (fast) {
-        const u64 ubs = (u64)bs;
-        for (long j = 0; j < cols; j++) {
-          const T q = (T)((u64)Ai[j] * R - ubs * Cj[j]) >> k;
-          Ai[j] = q;
-          acc |= mag(q);
-        }
-      } else {
-        const i128 D = (i128)e * (i128)std::numeric_limits<T>::max();
-        const u128 W = (u128)D * 2;
-        for (long j = 0; j < cols; j++) {
-          i128 t = (i128)Ai[j] * (i128)aars - (i128)bs * (i128)Arow[j];
-          if ((u128)t + (u128)D > W) overflow("I64 pivot");
-          const T q = (T)((u64)(t >> k) * inv);
-          Ai[j] = q;
-          acc |= mag(q);
-        }
-      }
-      if (LRS) Ai[s] = bs;
-      nb |= acc;
-    }
-    if (LRS) {
-      if (!neg)
-        for (long j = 0; j < cols; j++) Arow[j] = -Arow[j];
-      Arow[s] = neg ? -(T)e : (T)e;
-    }
+    nb |= rows_pass(A, stride, rows, r, p, all_fast);
+    if (!neg)
+      for (long j = 0; j < cols; j++) Arow[j] = -Arow[j];
+    Arow[s] = neg ? -(T)e : (T)e;
     det = (T)aars;
     bound = nb;
   }
 
- private:
+#ifdef LRSNASH_AVX2
+  // pivot_impl compiled for AVX2. GCC and Clang vectorize its row loop: the
+  // 64-bit products from three 32x32-bit products each, the arithmetic shift
+  // from a logical shift and the sign. The arithmetic is the same mod 2^64,
+  // so the results are identical.
+  __attribute__((target("avx2"), noinline)) void pivot_avx2(T *A, long stride, long rows,
+                                                            long cols, long r, long s,
+                                                            T &det, std::uint64_t &bound) {
+    pivot_impl(A, stride, rows, cols, r, s, det, bound);
+  }
+#endif
+
+  // The per-pivot constants of pivot().
+  struct Step {
+    const T *Arow;
+    const std::uint64_t *Cj;
+    long cols, s;
+    std::uint64_t aars, R, inv, e;
+    unsigned k;
+    bool neg;
+    double lim, daars, dMr;
+  };
+
+  // Rows i != r of a pivot: each row takes the fast path if the dictionary
+  // bound (all_fast) or its own maximum proves it, else exact_row. Returns
+  // the OR of mag over everything written.
+  __attribute__((always_inline)) static std::uint64_t rows_pass(
+      T *A, long stride, long rows, long r, const Step &p, bool all_fast) {
+    using u64 = std::uint64_t;
+    const long cols = p.cols;
+    u64 nb = 0;
+    for (long i = 0; i < rows; i++) {
+      if (i == r) continue;
+      T *Ai = A + i * stride;
+      const T b = Ai[p.s];
+      const T bs = p.neg ? -b : b;
+      bool fast = all_fast;
+      if (!fast) {
+        u64 Mi = 0;
+        for (long j = 0; j < cols; j++) Mi |= mag(Ai[j]);
+        fast = ((double)Mi + 1.0) * p.daars + (double)(bs < 0 ? -bs : bs) * p.dMr <=
+               p.lim;
+      }
+      u64 acc = mag(bs);
+      if (fast)
+        acc |= fast_row(Ai, p.Cj, cols, p.R, (u64)bs, p.k);
+      else
+        acc |= exact_row(Ai, p.Arow, cols, p.aars, bs, p.e, p.k, p.inv);
+      Ai[p.s] = bs;
+      nb |= acc;
+    }
+    return nb;
+  }
+
+  // The fast path of one row: Ai[j] = (Ai[j]*R - ubs*Cj[j]) >> k, wrapping
+  // mod 2^64. Cj is the kernel's own scratch and never overlaps the
+  // dictionary, which the restrict qualifiers tell the vectorizer.
+  __attribute__((always_inline)) static std::uint64_t fast_row(
+      T *__restrict Ai, const std::uint64_t *__restrict Cj, long cols,
+      std::uint64_t R, std::uint64_t ubs, unsigned k) {
+    std::uint64_t acc = 0;
+    for (long j = 0; j < cols; j++) {
+      const T q = (T)((std::uint64_t)Ai[j] * R - ubs * Cj[j]) >> k;
+      Ai[j] = q;
+      acc |= mag(q);
+    }
+    return acc;
+  }
+
+  // Ai[j] = (Ai[j]*aars - bs*Arow[j]) / e exactly, in 128-bit arithmetic,
+  // for a row the bound could not clear. Throws if a result does not fit.
+  // Returns the OR of mag over the results. Kept out of line so that it
+  // cannot crowd the registers of the fast loop.
+  __attribute__((noinline, cold)) static std::uint64_t exact_row(
+      T *Ai, const T *Arow, long cols, std::uint64_t aars, T bs, std::uint64_t e,
+      unsigned k, std::uint64_t inv) {
+    using i128 = __int128;
+    using u128 = unsigned __int128;
+    const i128 D = (i128)e * (i128)std::numeric_limits<T>::max();
+    const u128 W = (u128)D * 2;
+    std::uint64_t acc = 0;
+    for (long j = 0; j < cols; j++) {
+      const i128 t = (i128)Ai[j] * (i128)aars - (i128)bs * (i128)Arow[j];
+      if ((u128)t + (u128)D > W) overflow("I64 pivot");  // |t / e| > MAX
+      const T q = (T)((std::uint64_t)(t >> k) * inv);
+      Ai[j] = q;
+      acc |= mag(q);
+    }
+    return acc;
+  }
+
   std::vector<std::uint64_t> C;  // pivot scratch
 };
 
@@ -335,6 +402,7 @@ struct I128 {
   using T = __int128;
   using U = unsigned __int128;
   static constexpr const char *name = "int128";
+  static constexpr bool fixed_width = true;
   static constexpr T MAX = (T)(~(U)0 >> 1);
   static constexpr T MIN = -MAX - 1;
 
@@ -496,33 +564,20 @@ struct I128 {
     for (long j = 0; j < cols; j++) Mr |= hmag(Arow[j]);
     return ((double)bound + 1.0) * 0x1p64 *
                (u128_to_double(aars) + ((double)Mr + 1.0) * 0x1p64) <=
-           u128_to_double(e) * __builtin_ldexp(1.0, 126 - (int)k);
+           u128_to_double(e) * pow2(126 - (int)k);
   }
   static void from_i64(T &a, std::int64_t v) { a = v; }
   static void from_i128(T &a, __int128 v) { a = v; }
   void pivot(T *A, long stride, long rows, long cols, long r, long s, T &det,
              std::uint64_t &bound) {
-    pivot_core<true>(A, stride, rows, cols, r, s, det, bound);
-  }
-  // Full-tableau (Edmonds/Bareiss) pivot, used by Lemke-Howson: for i != r,
-  // A[i][j] = (A[i][j]*Ars - A[i][s]*A[r][j]) / det for all j (so column s
-  // becomes 0), row r unchanged, det = Ars. Requires Ars > 0.
-  void tableau_pivot(T *A, long stride, long rows, long cols, long r, long s,
-                     T &det, std::uint64_t &bound) {
-    pivot_core<false>(A, stride, rows, cols, r, s, det, bound);
-  }
-  template <bool LRS>
-  void pivot_core(T *A, long stride, long rows, long cols, long r, long s,
-                  T &det, std::uint64_t &bound) {
     using u64 = std::uint64_t;
     T *Arow = A + r * stride;
     const T ars = Arow[s];
     const bool neg = ars < 0;
     const U aars = uabs(ars);
     const U e = (U)det;
-    const unsigned k = ctz128(e);
+    const unsigned k = ctz128(e);  // <= 126, as det <= MAX
     const U inv = inv128(e >> k);
-    const U R = aars * inv;
     if ((long)C.size() < cols) C.resize(cols);
     U *Cj = C.data();
     u64 Mr = 0;
@@ -530,54 +585,104 @@ struct I128 {
       Cj[j] = (U)Arow[j] * inv;
       Mr |= hmag(Arow[j]);
     }
-    const double lim = u128_to_double(e) * __builtin_ldexp(1.0, 126 - (int)k);
-    const double daars = u128_to_double(aars), dMr = ((double)Mr + 1.0) * 0x1p64;
+    const Step p{Arow, Cj, cols, s, aars, aars * inv, inv, e, k, neg,
+                 u128_to_double(e) * pow2(126 - (int)k), u128_to_double(aars),
+                 ((double)Mr + 1.0) * 0x1p64};
     const bool all_fast = bound != ~(u64)0 &&
-                          ((double)bound + 1.0) * 0x1p64 * (daars + dMr) <= lim;
+                          ((double)bound + 1.0) * 0x1p64 * (p.daars + p.dMr) <= p.lim;
     u64 nb = Mr | (u64)(e >> 64) | (u64)(aars >> 64);
+    // The shift by k: none for k == 0 (det odd, about half of all pivots), a
+    // two-instruction 128-bit shift for k < 64, the general one otherwise.
+    if (k == 0)
+      nb |= rows_pass<0>(A, stride, rows, r, p, all_fast);
+    else if (k < 64)
+      nb |= rows_pass<1>(A, stride, rows, r, p, all_fast);
+    else
+      nb |= rows_pass<2>(A, stride, rows, r, p, all_fast);
+    if (!neg)
+      for (long j = 0; j < cols; j++) Arow[j] = -Arow[j];
+    Arow[s] = neg ? -(T)e : (T)e;
+    det = (T)aars;
+    bound = nb;
+  }
+
+ private:
+  // The per-pivot constants of pivot().
+  struct Step {
+    const T *Arow;
+    const U *Cj;
+    long cols, s;
+    U aars, R, inv, e;
+    unsigned k;
+    bool neg;
+    double lim, daars, dMr;
+  };
+
+  // Rows i != r of a pivot, as I64::rows_pass. SH: 0 if k == 0, 1 if
+  // 0 < k < 64, 2 if k >= 64. Returns the OR of hmag over everything written.
+  template <int SH>
+  __attribute__((always_inline)) static std::uint64_t rows_pass(
+      T *A, long stride, long rows, long r, const Step &p, bool all_fast) {
+    using u64 = std::uint64_t;
+    const long cols = p.cols;
+    const U *Cj = p.Cj;
+    const U R = p.R;
+    const unsigned k = p.k;
+    u64 nb = 0;
     for (long i = 0; i < rows; i++) {
       if (i == r) continue;
       T *Ai = A + i * stride;
-      const T b = Ai[s];
-      const T bs = neg ? -b : b;
+      const T b = Ai[p.s];
+      const T bs = p.neg ? -b : b;
       bool fast = all_fast;
       if (!fast) {
         u64 Mi = 0;
         for (long j = 0; j < cols; j++) Mi |= hmag(Ai[j]);
-        fast = ((double)Mi + 1.0) * 0x1p64 * daars +
-                   u128_to_double(uabs(bs)) * dMr <=
-               lim;
+        fast = ((double)Mi + 1.0) * 0x1p64 * p.daars + u128_to_double(uabs(bs)) * p.dMr <=
+               p.lim;
       }
       u64 acc = hmag(bs);
       if (fast) {
         const U ubs = (U)bs;
         for (long j = 0; j < cols; j++) {
-          const T q = (T)((U)Ai[j] * R - ubs * Cj[j]) >> k;
+          const T t = (T)((U)Ai[j] * R - ubs * Cj[j]);
+          T q;
+          if (SH == 0) {
+            q = t;
+          } else if (SH == 1) {
+            // A shift known to be < 64 is shrd + sar. GCC knows k < 64 here,
+            // folds the & 63 away and then emits the general 128-bit shift
+            // (test + two cmov); hiding k's range from it (an empty asm,
+            // inside the loop so that the & cannot be hoisted) keeps the &.
+            unsigned kk = k;
+            asm volatile("" : "+r"(kk));
+            q = t >> (kk & 63);
+          } else {
+            q = t >> k;
+          }
           Ai[j] = q;
           acc |= hmag(q);
         }
       } else {
-        pivot_row_exact(Ai, Arow, cols, aars, bs, e, k, inv);
-        for (long j = 0; j < cols; j++) acc |= hmag(Ai[j]);
+        acc |= pivot_row_exact(Ai, p.Arow, cols, p.aars, bs, p.e, k, p.inv);
       }
-      if (LRS) Ai[s] = bs;
+      Ai[p.s] = bs;
       nb |= acc;
     }
-    if (LRS) {
-      if (!neg)
-        for (long j = 0; j < cols; j++) Arow[j] = -Arow[j];
-      Arow[s] = neg ? -(T)e : (T)e;
-    }
-    det = (T)aars;
-    bound = nb;
+    return nb;
   }
 
-  // Ai[j] = (Ai[j]*aars - bs*Arow[j]) / e exactly, in 256-bit arithmetic.
-  static void pivot_row_exact(T *Ai, const T *Arow, long cols, U aars, T bs,
-                              U e, unsigned k, U inv) {
+ public:
+  // Ai[j] = (Ai[j]*aars - bs*Arow[j]) / e exactly, in 256-bit arithmetic,
+  // for a row the bound could not clear. Throws if a result does not fit.
+  // Returns the OR of hmag over the results. Kept out of line so that it
+  // cannot crowd the registers of the fast loop.
+  __attribute__((noinline, cold)) static std::uint64_t pivot_row_exact(
+      T *Ai, const T *Arow, long cols, U aars, T bs, U e, unsigned k, U inv) {
     const W256 E = umul(e, (U)MAX);  // largest allowed |t|
     const bool nbs = bs < 0;
     const U abs_bs = uabs(bs);
+    std::uint64_t acc = 0;
     for (long j = 0; j < cols; j++) {
       const T a = Ai[j], c = Arow[j];
       const W256 P1 = umul(uabs(a), aars), P2 = umul(abs_bs, uabs(c));
@@ -598,7 +703,9 @@ struct I128 {
       const U zk = k == 0 ? Z.lo : (Z.lo >> k) | (Z.hi << (128 - k));
       const U q = zk * inv;  // |t| / e, exact and <= MAX
       Ai[j] = nz ? -(T)q : (T)q;
+      acc |= hmag(Ai[j]);
     }
+    return acc;
   }
 
  private:
@@ -617,6 +724,7 @@ template <long W = 112> struct MP {
   static constexpr long long BASE = 1000000000LL;
   static constexpr long long MAXD = 9223372036854775807LL;
   static constexpr const char *name = "lrsmp";
+  static constexpr bool fixed_width = false;
   // Two words of headroom: normalize/divint may touch one word past length.
   struct T {
     long long v[W + 3];
@@ -928,10 +1036,6 @@ template <long W = 112> struct MP {
              std::uint64_t &) {
     dense_pivot(*this, A, stride, rows, cols, r, s, det);
   }
-  void tableau_pivot(T *A, long stride, long rows, long cols, long r, long s,
-                     T &det, std::uint64_t &) {
-    dense_tableau_pivot(*this, A, stride, rows, cols, r, s, det);
-  }
   static std::uint64_t magnitude_bound(const T *, long, long, long) {
     return ~(std::uint64_t)0;
   }
@@ -973,6 +1077,7 @@ template <long W = 112> struct MP {
 // ---------------------------------------------------------------------------
 struct GMP {
   static constexpr const char *name = "gmp";
+  static constexpr bool fixed_width = false;
   struct T {
     mpz_t z;
     T() { mpz_init(z); }
@@ -1020,10 +1125,6 @@ struct GMP {
   void pivot(T *A, long stride, long rows, long cols, long r, long s, T &det,
              std::uint64_t &) {
     dense_pivot(*this, A, stride, rows, cols, r, s, det);
-  }
-  void tableau_pivot(T *A, long stride, long rows, long cols, long r, long s,
-                     T &det, std::uint64_t &) {
-    dense_tableau_pivot(*this, A, stride, rows, cols, r, s, det);
   }
   static std::uint64_t magnitude_bound(const T *, long, long, long) {
     return ~(std::uint64_t)0;

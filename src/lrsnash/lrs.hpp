@@ -315,8 +315,8 @@ template <class Ar> struct Problem {
 
   // ------------------------------------------------------- basic steps
   // upstream reorder1: a[pos] has changed; move it to its sorted place in
-  // a[0..len-1], moving b[] along with it.
-  static void resort(long a[], long b[], long pos, long len) {
+  // a[0..len-1], moving b[] along with it. Returns that place.
+  static long resort(long a[], long b[], long pos, long len) {
     while (pos > 0 && a[pos] < a[pos - 1]) {
       std::swap(a[pos], a[pos - 1]);
       std::swap(b[pos], b[pos - 1]);
@@ -327,6 +327,7 @@ template <class Ar> struct Problem {
       std::swap(b[pos], b[pos + 1]);
       ++pos;
     }
+    return pos;
   }
 
   // upstream pivot() + update(): exchange basic B[r] with cobasic C[s]. The
@@ -340,13 +341,9 @@ template <class Ar> struct Problem {
     long *B = P->B.data(), *C = P->C.data();
     const long leave = B[r], enter = C[s];
     B[r] = enter;
-    resort(B, P->Row.data(), r, P->m + 1);
+    r = resort(B, P->Row.data(), r, P->m + 1);  // >= 1: B[0] = 0 < enter
     C[s] = leave;
-    resort(C, P->Col.data(), s, P->d);
-    for (r = 1; B[r] != enter; r++) {
-    }
-    for (s = 0; C[s] != leave; s++) {
-    }
+    s = resort(C, P->Col.data(), s, P->d);
   }
 
   // upstream lrs_ratio: the lexicographic minimum ratio test for entering
@@ -357,8 +354,10 @@ template <class Ar> struct Problem {
     long *cand = ratio_buf.data();  // candidate basis positions
     const long d = P->d;
     long ncand = 0;
-    for (long j = nvars + 1; j <= P->m; j++)
-      if (ar->negative(P->a(Row[j], col))) cand[ncand++] = j;
+    for (long j = nvars + 1; j <= P->m; j++) {  // branch-free append
+      cand[ncand] = j;
+      ncand += ar->negative(P->a(Row[j], col));
+    }
     if (ncand == 0) return 0;
     // Break ties column by column: first the right-hand side, then the
     // cobasic columns in index order, skipping columns of basic variables.
@@ -381,7 +380,12 @@ template <class Ar> struct Problem {
           long comp = 1;
           if (j != start) {
             const T &Air = P->a(i, ratiocol);
-            if (ar->positive(*Nmin) || ar->negative(Air)) {
+            if constexpr (Ar::fixed_width) {
+              // the sign tests below only skip this product, and give its
+              // sign (both denominators are negative); for fixed-width
+              // types the product is cheaper than the branches
+              comp = ar->comprod(*Nmin, P->a(i, col), Air, *Dmin);
+            } else if (ar->positive(*Nmin) || ar->negative(Air)) {
               if (ar->negative(*Nmin) || ar->positive(Air))
                 comp = ar->comprod(*Nmin, P->a(i, col), Air, *Dmin);
               else
@@ -436,10 +440,18 @@ template <class Ar> struct Problem {
       if (i == s) continue;
       const long j = Col[i];
       const T &A0j = P->a(0, j), &Arj = P->a(row, j);
-      if (ar->positive(A0j) || ar->negative(Arj))
+      if constexpr (Ar::fixed_width) {
+        // the same test without short-circuit branches (comprod is cheap
+        // and cannot throw for fixed-width types)
+        const bool pos0 = ar->positive(A0j), neg0 = ar->negative(A0j);
+        const bool posr = ar->positive(Arj), negr = ar->negative(Arj);
+        const bool lt = ar->comprod(A0j, P->a(row, col), P->a(0, col), Arj) == -1;
+        if ((pos0 | negr) & ((!neg0 & !posr) | lt)) return false;
+      } else if (ar->positive(A0j) || ar->negative(Arj)) {
         if ((!ar->negative(A0j) && !ar->positive(Arj)) ||
             ar->comprod(A0j, P->a(row, col), P->a(0, col), Arj) == -1)
           return false;
+      }
     }
     return true;
   }
